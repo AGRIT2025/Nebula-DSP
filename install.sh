@@ -206,6 +206,49 @@ else
 fi
 ok "Backend clonado en $INSTALL_DIR/backend"
 
+# ── Patch: eager connect a CamillaDSP al arranque ───────────────────────────
+# camillagui-backend solo se conecta al engine cuando llega el primer poll
+# a /api/status. Cualquier otro endpoint (/api/getconfig, /api/getparam/*,
+# etc.) llamado antes devuelve 500 "Not connected to CamillaDSP". El frontend
+# de Nebula DSP pega varios endpoints en paralelo al cargar, así que sin esto
+# se ven 500s intermitentes en el primer load. Lanzamos el reconnect thread
+# en build_app para que la conexión se establezca apenas arranca el service.
+python3 - "$INSTALL_DIR/backend/main.py" << 'PYEOF'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+src = p.read_text()
+marker = "Nebula DSP: kick off a connect attempt"
+if marker in src:
+    print("  [skip] main.py already patched")
+    sys.exit(0)
+needle = '    app["VALIDATOR"] = camillavalidator\n    return app\n'
+if needle not in src:
+    print(f"  [WARN] anchor not found in {p}; backend layout changed upstream")
+    sys.exit(0)
+patch = (
+    '    app["VALIDATOR"] = camillavalidator\n'
+    '\n'
+    '    # Nebula DSP: kick off a connect attempt at startup, so endpoints\n'
+    '    # like /api/getconfig do not 500 with "Not connected to CamillaDSP"\n'
+    '    # before the frontend has polled /api/status. _reconnect retries\n'
+    '    # with backoff until the engine is reachable, then the thread exits.\n'
+    '    import threading\n'
+    '    from backend.views import _reconnect\n'
+    '    _eager = threading.Thread(\n'
+    '        target=_reconnect,\n'
+    '        args=(app["CAMILLA"], app["STATUSCACHE"], camillavalidator),\n'
+    '        daemon=True,\n'
+    '    )\n'
+    '    _eager.start()\n'
+    '    app["STORE"]["reconnect_thread"] = _eager\n'
+    '\n'
+    '    return app\n'
+)
+p.write_text(src.replace(needle, patch))
+print("  [ok] main.py patched (eager-connect)")
+PYEOF
+ok "Backend parcheado: conexión eager al engine"
+
 # Virtualenv Python aislado
 python3 -m venv "$INSTALL_DIR/venv"
 "$INSTALL_DIR/venv/bin/pip" install --quiet --upgrade pip
