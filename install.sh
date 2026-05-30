@@ -250,21 +250,33 @@ section "Configuración"
 mkdir -p "$CONFIG_DIR/configs"
 
 # Config CamillaGUI backend
+# Keys must match BACKEND_CONFIG_SCHEMA in camillagui-backend/backend/settings_schemas.py
 cat > "$CONFIG_DIR/camillagui.yml" << EOF
 camilla_host: "127.0.0.1"
 camilla_port: 1234
+bind_address: "0.0.0.0"
 port: 5005
-gui_config_dir: "$CONFIG_DIR/gui"
+ssl_certificate: null
+ssl_private_key: null
+gui_config_file: null
 config_dir: "$CONFIG_DIR/configs"
 coeff_dir: "$CONFIG_DIR/coeffs"
 default_config: "$CONFIG_DIR/configs/default.yml"
-active_config: "$CONFIG_DIR/configs/default.yml"
-state_file: "$CONFIG_DIR/statefile.yml"
+statefile_path: "$CONFIG_DIR/statefile.yml"
+log_file: null
 on_set_active_config: null
 on_get_active_config: null
 supported_capture_types: null
 supported_playback_types: null
 EOF
+
+# camillagui-backend's settings.py loads config from a hardcoded path
+# ($INSTALL_DIR/backend/config/camillagui.yml), ignoring CAMILLAGUI_CONFIG env var.
+# Symlink the bundled path to /etc/nebula-dsp/camillagui.yml so:
+#   - users edit a single canonical file in /etc/
+#   - re-installs don't leave stale config behind
+mkdir -p "$INSTALL_DIR/backend/config"
+ln -sf "$CONFIG_DIR/camillagui.yml" "$INSTALL_DIR/backend/config/camillagui.yml"
 
 # State file
 cat > "$CONFIG_DIR/statefile.yml" << 'EOF'
