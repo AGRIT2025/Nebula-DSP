@@ -18,6 +18,14 @@ SERVICE_GUI="nebula-gui"
 REPO_URL="https://github.com/HEnquist/camilladsp"
 BACKEND_REPO="https://github.com/HEnquist/camillagui-backend"
 
+# Pinned upstream versions. These are the exact tags Nebula DSP has been
+# validated against — the main.py eager-connect patch below depends on the
+# build_app() shape from camillagui-backend v4.1.0. Bumping these requires
+# re-verifying the patch anchor still matches.
+BACKEND_TAG="v4.1.0"
+PYCAMILLA_TAG="v4.0.0"
+PYCAMILLA_PLOT_TAG="v4.1.0"
+
 # ── Colores ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
@@ -196,15 +204,13 @@ section "Backend Python"
 
 mkdir -p "$INSTALL_DIR/backend"
 
-# Clonar o actualizar backend
-if [[ -d "$INSTALL_DIR/backend/.git" ]]; then
-  info "Actualizando backend existente..."
-  git -C "$INSTALL_DIR/backend" pull --quiet
-else
-  info "Clonando backend..."
-  git clone --quiet "$BACKEND_REPO" "$INSTALL_DIR/backend"
-fi
-ok "Backend clonado en $INSTALL_DIR/backend"
+# Clonar backend en tag pinneado.
+# Si ya existe, lo descartamos para evitar arrastrar un checkout viejo
+# o un pull que mueva HEAD lejos del tag verificado.
+rm -rf "$INSTALL_DIR/backend"
+info "Clonando backend en $BACKEND_TAG..."
+git clone --quiet --depth 1 --branch "$BACKEND_TAG" "$BACKEND_REPO" "$INSTALL_DIR/backend"
+ok "Backend clonado en $INSTALL_DIR/backend ($BACKEND_TAG)"
 
 # ── Patch: eager connect a CamillaDSP al arranque ───────────────────────────
 # camillagui-backend solo se conecta al engine cuando llega el primer poll
@@ -253,10 +259,10 @@ ok "Backend parcheado: conexión eager al engine"
 python3 -m venv "$INSTALL_DIR/venv"
 "$INSTALL_DIR/venv/bin/pip" install --quiet --upgrade pip
 
-# Instalar pycamilladsp desde GitHub (no está en PyPI)
+# Instalar pycamilladsp desde GitHub (no está en PyPI), pinneado a tag.
 "$INSTALL_DIR/venv/bin/pip" install --quiet \
-  "git+https://github.com/HEnquist/pycamilladsp.git" \
-  "git+https://github.com/HEnquist/pycamilladsp-plot.git" \
+  "git+https://github.com/HEnquist/pycamilladsp.git@${PYCAMILLA_TAG}" \
+  "git+https://github.com/HEnquist/pycamilladsp-plot.git@${PYCAMILLA_PLOT_TAG}" \
   aiohttp aiohttp_cors
 
 # Dependencias de Room Correction
@@ -392,9 +398,11 @@ After=network.target ${SERVICE_ENGINE}.service
 Requires=${SERVICE_ENGINE}.service
 
 [Service]
+# main.py lee la config desde un path hardcodeado en backend/settings.py
+# (BASEPATH/config/camillagui.yml), que apuntamos por symlink a
+# $CONFIG_DIR/camillagui.yml en la sección "Configuración" más arriba.
 ExecStart=$INSTALL_DIR/venv/bin/python main.py
 WorkingDirectory=$INSTALL_DIR/backend
-Environment="CAMILLAGUI_CONFIG=$CONFIG_DIR/camillagui.yml"
 Restart=on-failure
 RestartSec=3
 User=$REAL_USER
@@ -426,7 +434,9 @@ ok "Dependencias del watcher instaladas"
 # usb_watcher.py escribe en /var/log/nebula-dsp-usb.log (FileHandler hardcoded).
 # Si no preparamos el archivo, el service falla con PermissionError porque
 # /var/log/ es propiedad de root y el daemon corre como $REAL_USER.
-install -m 0644 -o "$REAL_USER" -g "$REAL_USER" /dev/null /var/log/nebula-dsp-usb.log
+# Usamos `id -gn` para el grupo así no asumimos que existe un grupo homónimo.
+REAL_GROUP=$(id -gn "$REAL_USER")
+install -m 0644 -o "$REAL_USER" -g "$REAL_GROUP" /dev/null /var/log/nebula-dsp-usb.log
 
 # ── Room Correction service ──────────────────────────────────────────────────
 cat > "/etc/systemd/system/nebula-room-correction.service" << EOF
