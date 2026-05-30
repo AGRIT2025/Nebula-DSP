@@ -1,0 +1,53 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg-base:     #080810;
+  --color-bg-surface:  #0f0f1a;
+  --color-bg-elevated: #16162a;
+  --color-bg-card:     #1a1a2e;
+  --color-bg-input:    #12121f;
+  --color-border:      #252540;
+  --color-border-glow: #6366f133;
+  --color-text-primary:   #e8e8ff;
+  --color-text-secondary: #9090bb;
+  --color-text-muted:     #505070;
+  --color-accent:       #6366f1;
+  --color-accent-dim:   #6366f122;
+  --color-accent-hover: #818cf8;
+  --color-green:  #22c55e;
+  --color-yellow: #eab308;
+  --color-orange: #f97316;
+  --color-red:    #ef4444;
+  --color-cyan:   #06b6d4;
+  --color-purple: #a855f7;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background: #080810;
+  color: #e8e8ff;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: #080810; }
+::-webkit-scrollbar-thumb { background: #252540; border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: #505070; }
+
+input[type="range"] { cursor: pointer; }
+input:focus-visible { outline: none; }
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+@keyframes meter-flash {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
