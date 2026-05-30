@@ -423,6 +423,11 @@ chown "$REAL_USER:$REAL_USER" "$INSTALL_DIR/usb_watcher.py" \
 "$INSTALL_DIR/venv/bin/pip" install --quiet pyudev websockets pyyaml
 ok "Dependencias del watcher instaladas"
 
+# usb_watcher.py escribe en /var/log/nebula-dsp-usb.log (FileHandler hardcoded).
+# Si no preparamos el archivo, el service falla con PermissionError porque
+# /var/log/ es propiedad de root y el daemon corre como $REAL_USER.
+install -m 0644 -o "$REAL_USER" -g "$REAL_USER" /dev/null /var/log/nebula-dsp-usb.log
+
 # ── Room Correction service ──────────────────────────────────────────────────
 cat > "/etc/systemd/system/nebula-room-correction.service" << EOF
 [Unit]
