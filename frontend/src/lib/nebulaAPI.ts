@@ -77,7 +77,9 @@ export interface RcDesignResult {
 export const nebulaAPI = {
   getStatus:    () => apiGet<StatusResponse>('/api/status'),
   getConfig:    () => apiGet<CamillaConfig>('/api/getconfig'),
-  setConfig:    (c: CamillaConfig) => apiPost<void>('/api/setconfig', c),
+  // El backend espera { config: <yaml-object> } en setconfig — wrappear acá
+  // para que los callers no tengan que recordarlo.
+  setConfig:    (c: CamillaConfig) => apiPost<void>('/api/setconfig', { config: c }),
   validateConfig: (c: CamillaConfig) =>
     apiPost<{ result: string; error?: string }>('/api/validateconfig', c),
 
