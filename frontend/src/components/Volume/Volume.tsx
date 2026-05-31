@@ -290,15 +290,14 @@ export function Volume() {
               </div>
             </div>
 
-            {/* Engine state pill */}
+            {/* Engine state pill — only state, no brand info */}
             <div className="border-t border-[#1a1a2e] pt-3 text-[10px] font-mono text-[#505070] text-center">
               {status.connected ? (
                 <>
-                  <span className="text-[#22c55e]">●</span> {status.state ?? '—'} ·
-                  CDSP {status.raw?.cdsp_version ?? '—'}
+                  <span className="text-[#22c55e]">●</span> Engine {status.state ?? '—'}
                 </>
               ) : (
-                <span className="text-[#ef4444]">● ENGINE OFFLINE</span>
+                <span className="text-[#ef4444]">● Engine offline</span>
               )}
             </div>
 

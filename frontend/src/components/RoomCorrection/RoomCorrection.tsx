@@ -481,7 +481,7 @@ export function RoomCorrection() {
       {phase === 'applied' && (
         <div className="flex items-center gap-2 px-4 py-3 rounded-lg bg-[#22c55e15] border border-[#22c55e30] text-[#22c55e] text-sm">
           <span className="w-2 h-2 rounded-full bg-[#22c55e] animate-[pulse-dot_2s_ease-in-out_infinite]" />
-          Room correction active — filters injected into CamillaDSP engine
+          Room correction active — filters injected into the DSP engine
         </div>
       )}
 

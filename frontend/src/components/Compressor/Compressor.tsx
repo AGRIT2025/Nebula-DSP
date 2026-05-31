@@ -369,8 +369,8 @@ export function Compressor() {
             </div>
             <div className="text-[10px] text-[#505070] leading-relaxed border-t border-[#1a1a2e] pt-3">
               GR estimada del peak playback vs capture. El motor de
-              CamillaDSP no expone GR exacta por canal; este número
-              refleja cuándo hay reducción real en la cadena.
+              audio no expone GR exacta por canal; este número refleja
+              cuándo hay reducción real en la cadena.
             </div>
           </div>
         </Card>

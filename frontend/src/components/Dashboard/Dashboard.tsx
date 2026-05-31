@@ -28,11 +28,10 @@ export function Dashboard() {
             : <Badge label="Disconnected" color="gray" dot />
           }
         </div>
-        {s.connected && s.raw && (
-          <span className="text-[11px] text-[#505070] font-mono">
-            CamillaDSP {s.raw.cdsp_version} · Backend {s.raw.backend_version}
-          </span>
-        )}
+        {/* Engine version pill removed intentionally — the underlying engine
+            brand is an implementation detail and shouldn't be advertised in
+            the user-facing UI. Connection state is communicated via the
+            sidebar badge and the "Engine unavailable" message below. */}
         {!s.connected && (
           <span className="text-[11px] text-[#ef4444]">Engine unavailable</span>
         )}
