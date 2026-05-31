@@ -22,6 +22,11 @@ nebula_measurement.json
 # CamillaDSP engine source (downloaded by install.sh)
 engine/
 
+# Rust build artifacts for nebula-limiter — target/ is rebuilt on install.
+# Cargo.lock IS tracked (binary crates pin their dep versions for reproducible
+# builds across users / clean clones).
+nebula-limiter/target/
+
 # OS
 .DS_Store
 Thumbs.db

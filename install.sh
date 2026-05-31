@@ -519,13 +519,127 @@ EOF
 ok "Servicio nebula-usb-watcher creado"
 
 # ════════════════════════════════════════════════════════════════════════════
+# 11.5. Nebula Limiter — sidecar Rust, brickwall con lookahead + true-peak
+# ════════════════════════════════════════════════════════════════════════════
+section "Brickwall Limiter (Rust)"
+
+LIMITER_SRC="$SCRIPT_DIR/nebula-limiter"
+LIMITER_BIN_DIR="$INSTALL_DIR/bin"
+LIMITER_BIN="$LIMITER_BIN_DIR/nebula-limiter"
+
+mkdir -p "$LIMITER_BIN_DIR"
+
+if [[ -d "$LIMITER_SRC" ]]; then
+  # Rust toolchain: si no está, instalamos minimal rustup (sin pedir prompt).
+  if ! command -v cargo &>/dev/null; then
+    info "Instalando Rust (minimal) — necesario para compilar nebula-limiter..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sudo -u "$REAL_USER" sh -s -- -y --default-toolchain stable --profile minimal
+    # shellcheck disable=SC1091
+    source "/home/$REAL_USER/.cargo/env" 2>/dev/null || true
+    export PATH="/home/$REAL_USER/.cargo/bin:$PATH"
+  fi
+
+  # Headers ALSA: el crate `alsa` los necesita en build time.
+  if [[ "$PKG_MANAGER" == "apt" ]]; then
+    apt-get install -y --no-install-recommends libasound2-dev pkg-config >/dev/null 2>&1 \
+      || warn "No se pudo instalar libasound2-dev — la compilación puede fallar"
+  fi
+
+  info "Compilando nebula-limiter (release, ~30 s)..."
+  if sudo -u "$REAL_USER" -E bash -c "cd '$LIMITER_SRC' && cargo build --release --quiet"; then
+    install -m 755 "$LIMITER_SRC/target/release/nebula-limiter" "$LIMITER_BIN"
+    ok "Binario instalado en $LIMITER_BIN"
+  else
+    warn "Compilación del limitador falló — la GUI mostrará 'Offline' en el tab Limiter"
+  fi
+else
+  warn "No se encontró $LIMITER_SRC — el limitador no se instalará"
+fi
+
+# Cargar snd-aloop al arranque: necesario para insertar el limitador entre
+# CamillaDSP y el DAC físico.
+cat > /etc/modules-load.d/nebula-loopback.conf << 'EOF'
+# Cargado por systemd al boot. snd-aloop provee hw:Loopback para
+# insertar nebula-limiter entre CamillaDSP y el DAC físico.
+snd-aloop
+EOF
+cat > /etc/modprobe.d/nebula-loopback.conf << 'EOF'
+options snd-aloop enable=1 index=7 pcm_substreams=1
+EOF
+modprobe snd-aloop pcm_substreams=1 enable=1 index=7 2>/dev/null || true
+ok "snd-aloop configurado"
+
+# Service unit del limitador. Default: capture desde el loopback, playback
+# a `null` (audio descartado). Esto deja el service vivo + el socket de
+# control disponible sin grabar el DAC físico al boot; el usuario re-rutea
+# --playback a su DAC desde el tab Limiter (vía /api/limiter/params, una
+# vez que tengamos esa funcionalidad implementada).
+cat > "/etc/systemd/system/nebula-limiter.service" << EOF
+[Unit]
+Description=Nebula DSP — Lookahead Brickwall Limiter
+After=sound.target ${SERVICE_ENGINE}.service
+Wants=sound.target
+
+[Service]
+ExecStart=$LIMITER_BIN \\
+  --capture hw:Loopback,1,0 \\
+  --playback null \\
+  --rate 48000 --channels 2 --period 256 --periods 4 \\
+  --ceiling-db=-1.0 --lookahead-ms 3.0 --release-ms 50.0 \\
+  --true-peak \\
+  --socket /run/nebula-limiter/control.sock
+Restart=always
+RestartSec=2
+User=$REAL_USER
+Group=audio
+Nice=-10
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+RuntimeDirectory=nebula-limiter
+RuntimeDirectoryMode=0755
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+ok "Servicio nebula-limiter creado"
+
+# Copiar el proxy Python al backend y patchear main.py para registrar los
+# endpoints /api/limiter/*.
+if [[ -f "$SCRIPT_DIR/backend/nebula_limiter_routes.py" ]]; then
+  cp "$SCRIPT_DIR/backend/nebula_limiter_routes.py" "$INSTALL_DIR/backend/nebula_limiter_routes.py"
+  chown "$REAL_USER:$REAL_USER" "$INSTALL_DIR/backend/nebula_limiter_routes.py"
+
+  python3 - << PYEOF
+import pathlib, sys
+p = pathlib.Path("$INSTALL_DIR/backend/main.py")
+src = p.read_text()
+if "nebula_limiter_routes" in src:
+    print("  [skip] main.py ya tiene nebula_limiter_routes")
+    sys.exit(0)
+needle_imp = "from backend.routes import setup_routes, setup_static_routes"
+if needle_imp in src:
+    src = src.replace(needle_imp, needle_imp + "\nimport nebula_limiter_routes")
+needle_call = "    setup_static_routes(app)"
+if needle_call in src:
+    src = src.replace(needle_call, needle_call + "\n    nebula_limiter_routes.setup(app)")
+p.write_text(src)
+print("  [ok] main.py parcheado para /api/limiter/*")
+PYEOF
+  ok "Backend proxied: /api/limiter/{status,params,reset}"
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
 # 12. Habilitar e iniciar servicios
 # ════════════════════════════════════════════════════════════════════════════
 section "Iniciando servicios"
 
 systemctl daemon-reload
 systemctl enable "${SERVICE_ENGINE}.service" "${SERVICE_GUI}.service" \
-                 nebula-usb-watcher.service nebula-room-correction.service
+                 nebula-usb-watcher.service nebula-room-correction.service \
+                 nebula-limiter.service 2>/dev/null || true
 
 if [[ -f "$BIN_PATH" ]]; then
   systemctl start "${SERVICE_ENGINE}.service"         || warn "Engine no inició — verificá la config de audio"
@@ -533,6 +647,8 @@ if [[ -f "$BIN_PATH" ]]; then
   systemctl start "${SERVICE_GUI}.service"            || warn "GUI no inició — revisá los logs"
   systemctl start "nebula-usb-watcher.service"        || warn "USB watcher no inició"
   systemctl start "nebula-room-correction.service"    || warn "Room Correction server no inició"
+  [[ -x "$LIMITER_BIN" ]] && systemctl start "nebula-limiter.service" \
+    || warn "Brickwall Limiter no inició (no es crítico — el resto del DSP funciona)"
   ok "Servicios iniciados"
 else
   warn "Binario del engine no encontrado — servicios no iniciados"

@@ -1,0 +1,26 @@
+[package]
+name = "nebula-limiter"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Lookahead brickwall limiter sidecar for Nebula DSP"
+
+[[bin]]
+name = "nebula-limiter"
+path = "src/main.rs"
+
+[dependencies]
+alsa       = "0.9"
+clap       = { version = "4", features = ["derive"] }
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow     = "1"
+log        = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+panic         = "abort"
+strip         = true

@@ -130,6 +130,35 @@ export const nebulaAPI = {
   rcApply:  () => apiPost<{ ok: boolean }>('/api/rc/apply'),
   rcRemove: () => apiPost<{ ok: boolean }>('/api/rc/remove'),
   rcExport: () => '/api/rc/export',
+
+  // ── Brickwall Limiter sidecar ───────────────────────────────────────────
+  limiterStatus: () => apiGet<LimiterStatus>('/api/limiter/status'),
+  limiterSetParams: (p: Partial<LimiterParams>) =>
+    apiPost<LimiterStatus>('/api/limiter/params', p),
+  limiterReset: () => apiPost<LimiterStatus>('/api/limiter/reset'),
+}
+
+export interface LimiterStatus {
+  online:            boolean
+  // Present only when online: the sidecar publishes these.
+  gr_db?:             number
+  isp_hits?:          number
+  samples_processed?: number
+  samples_clipped?:   number
+  ceiling_db?:        number
+  lookahead_ms?:      number
+  true_peak?:         boolean
+  release_ms?:        number
+  sample_rate?:       number
+  channels?:          number
+  error?:             string
+}
+
+export interface LimiterParams {
+  ceiling_db:   number
+  lookahead_ms: number
+  true_peak:    boolean
+  release_ms:   number
 }
 
 export function formatDb(value: number, decimals = 1): string {

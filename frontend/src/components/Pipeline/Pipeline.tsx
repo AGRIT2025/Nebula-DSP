@@ -1,9 +1,9 @@
 import { useEffect, useState } from 'react'
 import { Card } from '@/components/ui/Card'
-import { ArrowRight, Box, Sliders, AudioWaveform, GitMerge, Wand2 } from 'lucide-react'
-import { nebulaAPI, type CamillaConfig } from '@/lib/nebulaAPI'
+import { ArrowRight, Box, Sliders, AudioWaveform, GitMerge, Wand2, ShieldCheck } from 'lucide-react'
+import { nebulaAPI, type CamillaConfig, type LimiterStatus } from '@/lib/nebulaAPI'
 
-type NodeType = 'input' | 'mixer' | 'filter' | 'compressor' | 'processor' | 'output'
+type NodeType = 'input' | 'mixer' | 'filter' | 'compressor' | 'processor' | 'limiter' | 'output'
 
 interface PipelineNode {
   id: string
@@ -19,6 +19,10 @@ const NODE_STYLE: Record<NodeType, { icon: typeof Box; color: string; bg: string
   filter:     { icon: Sliders,       color: '#6366f1', bg: '#6366f115' },
   compressor: { icon: AudioWaveform, color: '#eab308', bg: '#eab30815' },
   processor:  { icon: Wand2,         color: '#f97316', bg: '#f9731615' },
+  // The brickwall limiter sidecar lives AFTER the playback in the
+  // signal chain (snd-aloop topology); represented in red because it's
+  // the last line of defense before the DAC.
+  limiter:    { icon: ShieldCheck,   color: '#ef4444', bg: '#ef444415' },
   output:     { icon: Box,           color: '#22c55e', bg: '#22c55e15' },
 }
 
@@ -100,21 +104,43 @@ function buildPipeline(config: CamillaConfig): PipelineNode[] {
 
 export function Pipeline() {
   const [config, setConfig] = useState<CamillaConfig | null>(null)
+  const [limiter, setLimiter] = useState<LimiterStatus | null>(null)
   const [error, setError]   = useState<string | null>(null)
 
   useEffect(() => {
     let active = true
     const load = () => {
-      nebulaAPI.getConfig()
-        .then(c => { if (active) { setConfig(c); setError(null) } })
-        .catch(e => { if (active) setError(String(e)) })
+      Promise.all([
+        nebulaAPI.getConfig().catch(e => { if (active) setError(String(e)); return null }),
+        // Limiter status is best-effort; if the sidecar is off we just
+        // don't append the limiter node to the diagram.
+        nebulaAPI.limiterStatus().catch(() => null),
+      ]).then(([c, l]) => {
+        if (!active) return
+        if (c) { setConfig(c as CamillaConfig); setError(null) }
+        setLimiter(l)
+      })
     }
     load()
     const id = setInterval(load, 3000)
     return () => { active = false; clearInterval(id) }
   }, [])
 
-  const nodes = config ? buildPipeline(config) : []
+  const baseNodes = config ? buildPipeline(config) : []
+  const nodes = limiter?.online
+    ? [
+        // Splice the limiter in just before the Playback node so the
+        // viewer reads: capture → processing → limiter → playback.
+        ...baseNodes.slice(0, -1),
+        {
+          id: 'nebula-limiter',
+          type: 'limiter' as NodeType,
+          label: 'Brickwall',
+          detail: `${(limiter.ceiling_db ?? -1).toFixed(1)} dBFS · ${limiter.lookahead_ms?.toFixed(0) ?? 3} ms LA`,
+        },
+        ...baseNodes.slice(-1),
+      ]
+    : baseNodes
   const channelLabels = nodes[0]?.channels
     ? Array.from({ length: nodes[0].channels }, (_, i) => `Ch ${i + 1}`)
     : []

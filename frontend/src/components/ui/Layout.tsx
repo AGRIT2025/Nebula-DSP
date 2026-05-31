@@ -3,18 +3,19 @@ import { NavLink, useLocation } from 'react-router-dom'
 import type { ReactNode } from 'react'
 import {
   LayoutDashboard, Sliders, AudioWaveform, Route,
-  Volume2, Cpu, Menu, X, Radio, ScanLine
+  Volume2, Cpu, Menu, X, Radio, ScanLine, ShieldCheck
 } from 'lucide-react'
 import { useEngineStatus } from '@/hooks/useEngineStatus'
 
 const NAV = [
-  { to: '/',          icon: LayoutDashboard, label: 'Dashboard'   },
-  { to: '/compressor',icon: AudioWaveform,   label: 'Compressor'  },
-  { to: '/filters',   icon: Sliders,         label: 'Filters'     },
-  { to: '/pipeline',  icon: Route,           label: 'Pipeline'    },
-  { to: '/volume',    icon: Volume2,          label: 'Volume'      },
-  { to: '/devices',         icon: Cpu,      label: 'Devices'         },
-  { to: '/room-correction', icon: ScanLine, label: 'Room Correction' },
+  { to: '/',                icon: LayoutDashboard, label: 'Dashboard'       },
+  { to: '/compressor',      icon: AudioWaveform,   label: 'Compressor'      },
+  { to: '/limiter',         icon: ShieldCheck,     label: 'Limiter'         },
+  { to: '/filters',         icon: Sliders,         label: 'Filters'         },
+  { to: '/pipeline',        icon: Route,           label: 'Pipeline'        },
+  { to: '/volume',          icon: Volume2,         label: 'Volume'          },
+  { to: '/devices',         icon: Cpu,             label: 'Devices'         },
+  { to: '/room-correction', icon: ScanLine,        label: 'Room Correction' },
 ]
 
 const STATE_COLOR: Record<string, string> = {
