@@ -31,16 +31,30 @@ import websockets
 import yaml
 
 # ── Logging ──────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+# Cuando el watcher corría como service standalone, basicConfig acá era
+# suficiente. Tras la consolidación, camillagui-backend ya configuró el
+# root logger antes de que importemos este módulo, así que basicConfig
+# queda no-op y los mensajes se pierden. Solución: attach explícitamente
+# los handlers a *nuestro* logger en vez de delegar al root.
+_FORMATTER = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("/var/log/nebula-dsp-usb.log"),
-    ],
 )
 log = logging.getLogger("nebula.usb")
+log.setLevel(logging.INFO)
+log.propagate = False  # no doble-loggear vía root
+if not log.handlers:
+    _stream = logging.StreamHandler(sys.stdout)
+    _stream.setFormatter(_FORMATTER)
+    log.addHandler(_stream)
+    try:
+        _file = logging.FileHandler("/var/log/nebula-dsp-usb.log")
+        _file.setFormatter(_FORMATTER)
+        log.addHandler(_file)
+    except (PermissionError, OSError):
+        # /var/log/nebula-dsp-usb.log no existe / no escribible.
+        # No fatal — seguimos con el stream a stdout (journald lo captura).
+        pass
 
 # ── Configuración ─────────────────────────────────────────────────────────────
 CDSP_WS_HOST    = os.getenv("CDSP_HOST",    "127.0.0.1")
