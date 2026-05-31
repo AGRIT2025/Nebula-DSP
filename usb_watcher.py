@@ -374,9 +374,14 @@ class CamillaDSPClient:
 class UsbAudioWatcher:
     """
     Monitorea eventos udev de audio USB y reconfigura el engine automáticamente.
+
+    Cuando corre embebido en el backend Python (vía `setup(app)`), también
+    refresca `app["STATUSCACHE"]["{playback,capture}_devices"]` tras cada
+    plug/unplug — sino la GUI sigue viendo la lista ALSA cacheada al boot
+    y el badge "USB Connected" no refleja la desconexión.
     """
 
-    def __init__(self):
+    def __init__(self, app=None):
         self.scanner  = AlsaScanner()
         self.config   = ConfigManager(NEBULA_CONFIG)
         self.client   = CamillaDSPClient(CDSP_WS_HOST, CDSP_WS_PORT)
@@ -385,6 +390,45 @@ class UsbAudioWatcher:
         self._monitor.filter_by(subsystem="sound")
         self._current_device: Optional[AudioDevice] = None
         self._pending_task: Optional[asyncio.Task] = None
+        # Reference to the aiohttp app so we can repopulate STATUSCACHE
+        # in-process.  None when running standalone (no cache to refresh).
+        self._app = app
+
+    async def _refresh_status_cache(self) -> None:
+        """Re-query CamillaDSP for the current ALSA device list and update
+        the backend's STATUSCACHE.  No-op if we're standalone or the
+        engine is unreachable."""
+        if self._app is None:
+            return
+        try:
+            cdsp = self._app.get("CAMILLA")
+            cache = self._app.get("STATUSCACHE")
+            if cdsp is None or cache is None:
+                return
+            if not cdsp.is_connected():
+                # Engine offline; clear cached lists so the GUI sees empty
+                # instead of stale entries that no longer exist.
+                cache["playback_devices"] = {}
+                cache["capture_devices"]  = {}
+                log.info("Cache invalidado: engine offline (lista vacía)")
+                return
+            # Use the engine's view of ALSA, the same source the upstream
+            # camillagui-backend uses on initial _reconnect.  Engine calls
+            # snd_pcm_open under the hood so this matches what /api/status
+            # has historically shown — just refreshed live.
+            backends = cdsp.general.supported_device_types()
+            pb_backends, cap_backends = backends
+            new_pb, new_cap = {}, {}
+            for b in pb_backends:
+                new_pb[b] = cdsp.general.list_playback_devices(b)
+            for b in cap_backends:
+                new_cap[b] = cdsp.general.list_capture_devices(b)
+            cache["playback_devices"] = new_pb
+            cache["capture_devices"]  = new_cap
+            log.info("STATUSCACHE refrescado: %d playback / %d capture entries (Alsa)",
+                     len(new_pb.get("Alsa", [])), len(new_cap.get("Alsa", [])))
+        except Exception as e:
+            log.warning("No se pudo refrescar STATUSCACHE: %s", e)
 
     async def _handle_device_added(self, udev_device) -> None:
         """Maneja la conexión de un nuevo dispositivo de audio."""
@@ -428,6 +472,9 @@ class UsbAudioWatcher:
         else:
             log.warning("Engine no disponible — config actualizada, se aplicará al próximo inicio")
 
+        # Refrescar el cache del backend para que la GUI vea el cambio.
+        await self._refresh_status_cache()
+
     async def _handle_device_removed(self, udev_device) -> None:
         """Maneja la desconexión de un dispositivo de audio."""
         log.info("Dispositivo USB de audio desconectado")
@@ -441,6 +488,10 @@ class UsbAudioWatcher:
             await self._handle_device_added(udev_device)
         else:
             log.info("Sin dispositivos USB de audio — el engine seguirá con config actual")
+            # Refrescar el cache aunque no haya plug nuevo: el badge debe
+            # bajar del estado "USB Connected" al ver que la lista ALSA
+            # ya no contiene el dispositivo.
+            await self._refresh_status_cache()
 
     async def _process_event(self, action: str, udev_device) -> None:
         """Despacha el evento al handler correspondiente."""
@@ -495,6 +546,14 @@ class UsbAudioWatcher:
         else:
             log.info("Sin dispositivos USB al iniciar — esperando conexión")
 
+        # El cache del backend se popula al boot vía _reconnect(); puede
+        # haber quedado desincronizado si el engine se reinició mientras
+        # un USB se plugeaba/desconectaba.  Forzamos un refresh ahora —
+        # con un pequeño delay para que el engine termine su init si vino
+        # primero el watcher.
+        await asyncio.sleep(2.0)
+        await self._refresh_status_cache()
+
         await self._event_loop()
 
 
@@ -502,10 +561,11 @@ class UsbAudioWatcher:
 # Integration with the consolidated backend
 # ════════════════════════════════════════════════════════════════════════════
 
-async def _supervisor():
+async def _supervisor(app=None):
     """Wraps UsbAudioWatcher.start() with the same restart-on-error logic
-    the standalone main() had.  Used by `setup(app)` below."""
-    watcher = UsbAudioWatcher()
+    the standalone main() had.  `app` is passed through so the watcher
+    can refresh STATUSCACHE in-process."""
+    watcher = UsbAudioWatcher(app=app)
     while True:
         try:
             await watcher.start()
@@ -522,11 +582,14 @@ def setup(app) -> None:  # `app: aiohttp.web.Application` — imported lazily to
 
     Registers an `on_startup` hook so the supervisor task is created
     once the event loop is running, and an `on_cleanup` hook to cancel
-    it gracefully on shutdown.
+    it gracefully on shutdown.  `app` is captured so the watcher can
+    refresh STATUSCACHE (used by /api/status) in-process when a USB
+    plug/unplug event occurs — otherwise the GUI's "USB Connected"
+    badge stays stale because the cache is only populated once at boot.
     """
     async def _on_startup(_app):
         log.info("Nebula USB watcher: scheduling background task")
-        _app["_usb_watcher_task"] = asyncio.create_task(_supervisor())
+        _app["_usb_watcher_task"] = asyncio.create_task(_supervisor(_app))
 
     async def _on_cleanup(_app):
         task = _app.get("_usb_watcher_task")
