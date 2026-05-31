@@ -182,3 +182,38 @@ export function levelColor(db: number): string {
   if (db >= -12) return '#eab308'
   return '#22c55e'
 }
+
+// ── K-system metering ───────────────────────────────────────────────────────
+//
+// Bob Katz's K-system shifts the "0 dB" reference of the meter below 0 dBFS
+// so the visual headroom matches mastering conventions per genre:
+//   K-20: classical / acoustic → 20 dB headroom above the 0-mark
+//   K-14: rock / pop          → 14 dB
+//   K-12: TV / broadcast      → 12 dB
+//   off:  raw dBFS (no shift)
+//
+// At render time, displayed_db = raw_db + shift_db. Same audio, different
+// scale numbering — the meter "feels" different without changing the signal.
+
+export type KSystem = 'off' | 'K-12' | 'K-14' | 'K-20'
+
+export const K_SYSTEM_SHIFT: Record<KSystem, number> = {
+  'off':  0,
+  'K-12': 12,
+  'K-14': 14,
+  'K-20': 20,
+}
+
+export const K_SYSTEM_LABEL: Record<KSystem, string> = {
+  'off':  'dBFS',
+  'K-12': 'K-12 (broadcast)',
+  'K-14': 'K-14 (pop / rock)',
+  'K-20': 'K-20 (classical)',
+}
+
+export const K_SYSTEMS: KSystem[] = ['off', 'K-12', 'K-14', 'K-20']
+
+/** Returns dB shifted into the chosen K-system scale. */
+export function kShift(rawDb: number, k: KSystem): number {
+  return rawDb + K_SYSTEM_SHIFT[k]
+}

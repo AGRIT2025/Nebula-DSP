@@ -1,5 +1,5 @@
 import { useEngineStatus } from '@/hooks/useEngineStatus'
-import { nebulaAPI, formatDb } from '@/lib/nebulaAPI'
+import { nebulaAPI } from '@/lib/nebulaAPI'
 import { Card, StatCard, Badge } from '@/components/ui/Card'
 import { ChannelMeters } from '@/components/ui/VuMeter'
 import { UsbDeviceStatus } from '@/components/ui/UsbDeviceStatus'
@@ -12,18 +12,9 @@ const STATE_CONFIG = {
   STALLED:  { label: 'Stalled',  color: 'red'    as const },
 }
 
-function latencyLabel(ms: number): { color: 'green' | 'yellow' | 'red'; label: string } {
-  if (ms <= 0)   return { color: 'gray' as any, label: '—' }
-  if (ms < 20)   return { color: 'green',  label: 'Excellent' }
-  if (ms < 50)   return { color: 'green',  label: 'Good' }
-  if (ms < 100)  return { color: 'yellow', label: 'Moderate' }
-  return           { color: 'red',    label: 'High' }
-}
-
 export function Dashboard() {
   const s = useEngineStatus(200)
   const stateCfg = s.state ? STATE_CONFIG[s.state] : null
-  const lat = latencyLabel(s.latencyMs)
 
   return (
     <div className="flex flex-col gap-5">
@@ -86,58 +77,11 @@ export function Dashboard() {
         </Card>
       </div>
 
-      {/* ── Volume + Latency ── */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-
-        {/* Master Volume */}
-        <Card title="Master Volume" accent="#6366f1">
-          <div className="flex items-center justify-between">
-            <span className="text-3xl font-bold font-mono tabular-nums text-[#e8e8ff]">
-              {formatDb(s.volume)}
-            </span>
-            <Badge
-              label={s.mute ? 'MUTED' : 'LIVE'}
-              color={s.mute ? 'red' : 'green'}
-            />
-          </div>
-          {/* Volume bar */}
-          <div className="mt-3 h-1 bg-[#12121f] rounded-full overflow-hidden">
-            <div
-              className="h-full rounded-full transition-none"
-              style={{
-                width: `${Math.max(0, Math.min(100, ((s.volume + 80) / 100) * 100))}%`,
-                background: s.mute
-                  ? '#ef4444'
-                  : 'linear-gradient(to right, #6366f1, #a855f7)',
-              }}
-            />
-          </div>
-        </Card>
-
-        {/* Latency */}
-        <Card title="Latency" accent="#eab308">
-          <div className="flex items-baseline gap-2">
-            <span className="text-3xl font-bold font-mono tabular-nums text-[#e8e8ff]">
-              {s.latencyMs > 0 ? s.latencyMs.toFixed(1) : '—'}
-            </span>
-            {s.latencyMs > 0 && <span className="text-sm text-[#505070]">ms</span>}
-            <span className="ml-auto"><Badge label={lat.label} color={lat.color as any} /></span>
-          </div>
-          <div className="mt-3 h-1 bg-[#12121f] rounded-full overflow-hidden">
-            <div
-              className="h-full rounded-full transition-none"
-              style={{
-                width: `${Math.min(100, (s.latencyMs / 200) * 100)}%`,
-                background: s.latencyMs < 50 ? '#22c55e' : s.latencyMs < 100 ? '#eab308' : '#ef4444',
-              }}
-            />
-          </div>
-          <div className="flex justify-between mt-1.5 text-[10px] text-[#505070] font-mono">
-            <span>Buffer: {s.bufferLevel} smp</span>
-            <span>0 · 50 · 100 · 200 ms</span>
-          </div>
-        </Card>
-      </div>
+      {/* Master Volume + Latency vivieron acá hasta el rediseño del tab Volume
+         (que ahora tiene su propio Master panel con peak/RMS/load/latency/clip
+         y un fader bank de 5 strips). Para evitar duplicación, el Dashboard
+         queda enfocado en VU + stats agregadas; los controles de volumen
+         viven en el tab Volume. */}
 
       {/* ── Clipping alert ── */}
       {s.clippedDelta > 0 && (
