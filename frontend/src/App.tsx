@@ -1,4 +1,9 @@
-import { BrowserRouter, Routes, Route } from 'react-router-dom'
+// HashRouter (not HashRouter): the backend serves the SPA only under
+// /gui/, so deep-link URLs like http://host/pipeline would 404 on refresh.
+// With HashRouter, the route lives in the URL fragment
+// (e.g. /gui/index.html#/pipeline) and refresh always lands on a real
+// index.html served by the static handler.
+import { HashRouter, Routes, Route } from 'react-router-dom'
 import { Layout } from '@/components/ui/Layout'
 import { Dashboard } from '@/components/Dashboard/Dashboard'
 import { Compressor } from '@/components/Compressor/Compressor'
@@ -11,7 +16,7 @@ import { RoomCorrection } from '@/components/RoomCorrection/RoomCorrection'
 
 export default function App() {
   return (
-    <BrowserRouter>
+    <HashRouter>
       <Layout>
         <Routes>
           <Route path="/"                element={<Dashboard />}      />
@@ -24,6 +29,6 @@ export default function App() {
           <Route path="/room-correction" element={<RoomCorrection />} />
         </Routes>
       </Layout>
-    </BrowserRouter>
+    </HashRouter>
   )
 }
