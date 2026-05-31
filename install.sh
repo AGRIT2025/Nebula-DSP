@@ -67,6 +67,9 @@ ok "Arquitectura: $ARCH → $CDSP_ARCH"
 
 # Usuario real (el que ejecutó sudo)
 REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
+# Definido temprano porque varias secciones lo usan en `install -g $REAL_GROUP`
+# antes de la sección "USB Audio Watcher" (donde estaba originalmente).
+REAL_GROUP=$(id -gn "$REAL_USER")
 REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
 ok "Usuario: $REAL_USER ($REAL_HOME)"
 
@@ -482,8 +485,7 @@ ok "Dependencias Python de USB watcher instaladas"
 # usb_watcher.py escribe en /var/log/nebula-dsp-usb.log (FileHandler hardcoded).
 # Aunque ahora corre dentro del backend, sigue usando el mismo path.
 # /var/log/ es propiedad de root, así que precreamos el archivo con
-# ownership del usuario que corre el backend.
-REAL_GROUP=$(id -gn "$REAL_USER")
+# ownership del usuario que corre el backend (REAL_GROUP ya definido arriba).
 install -m 0644 -o "$REAL_USER" -g "$REAL_GROUP" /dev/null /var/log/nebula-dsp-usb.log
 
 # Patch a main.py para importar usb_watcher + room_correction_server y
