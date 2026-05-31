@@ -60,8 +60,10 @@ if not log.handlers:
 CDSP_WS_HOST    = os.getenv("CDSP_HOST",    "127.0.0.1")
 CDSP_WS_PORT    = int(os.getenv("CDSP_PORT", "1234"))
 NEBULA_CONFIG   = Path(os.getenv("NEBULA_CONFIG", "/etc/nebula-dsp/configs/default.yml"))
-SETTLE_DELAY_S  = 2.5   # segundos para que ALSA registre el dispositivo
-RECONNECT_DELAY = 5.0   # segundos entre reintentos de WebSocket
+SETTLE_DELAY_S  = 2.5    # segundos para que ALSA registre el dispositivo
+RECONNECT_DELAY = 5.0    # segundos entre reintentos de WebSocket
+RECONCILE_INT_S = 15.0   # cada cuántos segundos hacer un reconcile defensivo
+                         # contra la realidad ALSA (independiente de udev)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -229,28 +231,37 @@ class AlsaScanner:
             snd_path = Path(f"/dev/snd/pcmC{device.card_id}D{device.device_id}p")
             return snd_path.exists()
 
-    def probe_best_format(self, device: AudioDevice) -> str:
+    def probe_best_format(self, device: AudioDevice) -> Optional[str]:
         """Pregunta a ALSA qué formatos soporta este device y devuelve el
         mejor disponible (preferencia: S32_LE > S24_3LE > S16_LE).
 
+        Devuelve `None` si NO se pudo medir con confianza (por ejemplo,
+        el device está abierto en exclusiva por el engine, o arecord no
+        respondió en time). El caller debe mantener la config existente
+        en ese caso — un fallback ciego a S16_LE causaría ping-pong con
+        el reconcile periódico cuando el device realmente es S32_LE-only.
+
         Esto evita que el engine quede en restart-loop tras hot-swap
         cuando el USB nuevo no soporta el formato que tenía configurado
-        el dispositivo anterior (típico al cambiar entre un headset
-        consumer S16_LE-only y una interface pro S32_LE-only)."""
+        el dispositivo anterior."""
         try:
             result = subprocess.run(
                 ["arecord", "--dump-hw-params", "-D", device.capture_device, "-f", "cd"],
                 capture_output=True, timeout=2, text=True,
             )
             combined = result.stdout + result.stderr
+            # `arecord --dump-hw-params` siempre imprime la sección
+            # "HW Params of device" si pudo abrir el dispositivo. Si esa
+            # cabecera no está, no logró abrir → no podemos confiar en
+            # nuestra detección.
+            if "HW Params of device" not in combined and "FORMAT" not in combined:
+                return None
             for fmt in ("S32_LE", "S24_3LE", "S16_LE"):
                 if fmt in combined:
                     return fmt
         except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
-        # Fallback seguro: S16_LE es universalmente soportado por USB Audio
-        # Class 1.x devices.
-        return "S16_LE"
+        return None
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -607,6 +618,90 @@ class UsbAudioWatcher:
         finally:
             observer.stop()
 
+    async def _reconcile(self, reason: str = "periodic") -> None:
+        """Compara la realidad ALSA con la config y arregla si difieren.
+
+        Cubre el caso donde los eventos udev se pierden — pasa típicamente
+        cuando el usuario hace hot-swaps rápidos (unplug + plug en < 500 ms)
+        y el debounce del event loop coalesce los eventos como un solo
+        `remove`, sin enterarse del `add` posterior. También cubre cards
+        que comparten el mismo card index (e.g. ambas placas USB salen como
+        `card 1`): udev manda eventos pero el config ya tiene `hw:1,0` y
+        la igualdad textual hace que no se haga nada, aunque el formato
+        sea distinto.
+        """
+        present = self.scanner.get_best_usb_device()
+        cap_dev, _ = self.config.get_current_devices()
+
+        if present is None and self._current_device is not None:
+            log.info("[reconcile %s] dispositivo previo %s ya no presente",
+                     reason, self._current_device)
+            self._current_device = None
+            await self._refresh_status_cache()
+            return
+
+        if present is None:
+            return  # nada que hacer
+
+        # Leer el formato actual del config
+        try:
+            cfg = self.config.load()
+            cur_fmt = (((cfg.get("devices") or {}).get("capture") or {}).get("format") or "")
+        except Exception:
+            cur_fmt = ""
+
+        # Probar el formato real del device. Si devuelve None (típicamente
+        # porque el engine tiene el device abierto en exclusiva ALSA), no
+        # podemos saber el formato real → confiamos en el config actual y
+        # no hacemos cambios.
+        probed_fmt = self.scanner.probe_best_format(present)
+        effective_fmt = probed_fmt if probed_fmt else cur_fmt
+
+        device_matches = (cap_dev == present.capture_device)
+        format_matches = (cur_fmt == effective_fmt)
+
+        # Si la config + formato YA reflejan la realidad ALSA, no hay nada
+        # que reconciliar — incluso si self._current_device interno estaba
+        # a None (típico tras un restart del backend con USB ya conectado).
+        if device_matches and format_matches:
+            if self._current_device is None:
+                # Sincronizamos el state interno silenciosamente.
+                self._current_device = present
+            return
+
+        # Si el probe falló (no podemos saber el formato real) Y el device
+        # actual coincide con el config, no tocamos nada — evita el
+        # ping-pong S16_LE↔S32_LE con el engine running.
+        if not probed_fmt and device_matches:
+            return
+
+        log.info(
+            "[reconcile %s] desfase detectado — device: %s%s · format: %s%s",
+            reason,
+            cap_dev, '' if device_matches else f' → {present.capture_device}',
+            cur_fmt, '' if format_matches else f' → {effective_fmt}',
+        )
+
+        changed = self.config.update_audio_device(present, sample_format=probed_fmt)
+        self._current_device = present
+
+        if changed:
+            log.info("[reconcile %s] recargando engine con %s (%s)",
+                     reason, present.capture_device, effective_fmt)
+            await self.client.reload_config()
+            await self._refresh_status_cache()
+
+    async def _periodic_reconcile(self) -> None:
+        """Background task: re-check ALSA reality every RECONCILE_INT_S
+        seconds. Cheap (no I/O if everything is in sync) and saves us
+        from missed udev events."""
+        while True:
+            await asyncio.sleep(RECONCILE_INT_S)
+            try:
+                await self._reconcile("periodic")
+            except Exception as e:
+                log.warning("reconcile error: %s", e)
+
     async def start(self) -> None:
         """Inicia el watcher. Escanea el estado inicial y luego monitorea."""
         log.info("Nebula DSP USB Audio Watcher iniciando...")
@@ -614,25 +709,18 @@ class UsbAudioWatcher:
         log.info("Engine WS: ws://%s:%d", CDSP_WS_HOST, CDSP_WS_PORT)
 
         # Escaneo inicial — detectar placa ya conectada al arrancar
-        initial = self.scanner.get_best_usb_device()
-        if initial:
-            log.info("Dispositivo USB ya conectado: %s", initial)
-            self._current_device = initial
-            # Actualizar config si el dispositivo difiere del actual
-            cap, _ = self.config.get_current_devices()
-            if cap != initial.capture_device:
-                log.info("Config desactualizada, actualizando al dispositivo presente")
-                self.config.update_audio_device(initial)
-        else:
-            log.info("Sin dispositivos USB al iniciar — esperando conexión")
+        await self._reconcile("startup")
 
-        # El cache del backend se popula al boot vía _reconnect(); puede
-        # haber quedado desincronizado si el engine se reinició mientras
-        # un USB se plugeaba/desconectaba.  Forzamos un refresh ahora —
-        # con un pequeño delay para que el engine termine su init si vino
-        # primero el watcher.
+        # El cache del backend se popula al boot vía _reconnect(); forzamos
+        # un refresh ahora (con un pequeño delay para que el engine termine
+        # su init si vino primero el watcher).
         await asyncio.sleep(2.0)
         await self._refresh_status_cache()
+
+        # Lanzar reconciliación periódica en background para detectar
+        # cambios que se pierdan por debounce o por subir/bajar el USB
+        # mientras el watcher estaba ocupado.
+        asyncio.create_task(self._periodic_reconcile())
 
         await self._event_loop()
 
