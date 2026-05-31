@@ -1,137 +1,167 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Card } from '@/components/ui/Card'
-import { Plus, ChevronDown, ChevronRight } from 'lucide-react'
+import { ChevronDown, ChevronRight, RefreshCw } from 'lucide-react'
+import { nebulaAPI, type CamillaConfig } from '@/lib/nebulaAPI'
 
-interface Filter {
-  id: string
-  type: string
-  channel: number
-  enabled: boolean
-  params: Record<string, number | string>
+interface ConfiguredFilter {
+  name:   string
+  type:   string
+  subtype?: string
+  params: Record<string, unknown>
 }
-
-const FILTER_TYPES = [
-  'Peaking', 'Highshelf', 'Lowshelf', 'Highpass', 'Lowpass',
-  'Notch', 'Allpass', 'Gain', 'Delay', 'Loudness',
-]
 
 const FILTER_COLORS: Record<string, string> = {
-  Peaking: '#6366f1', Highshelf: '#a855f7', Lowshelf: '#06b6d4',
-  Highpass: '#22c55e', Lowpass: '#eab308', Notch: '#f97316',
-  Allpass: '#ef4444', Gain: '#9090bb', Delay: '#505070', Loudness: '#818cf8',
+  Biquad:        '#6366f1',
+  BiquadCombo:   '#818cf8',
+  Conv:          '#a855f7',
+  Compressor:    '#eab308',
+  Limiter:       '#f97316',
+  Gain:          '#9090bb',
+  Volume:        '#06b6d4',
+  Loudness:      '#22c55e',
+  Delay:         '#505070',
+  DiffEq:        '#ef4444',
 }
 
-const DEMO_FILTERS: Filter[] = [
-  { id: '1', type: 'Highpass',  channel: 0, enabled: true,  params: { freq: 80,    q: 0.707 } },
-  { id: '2', type: 'Peaking',   channel: 0, enabled: true,  params: { freq: 1000,  q: 1.5, gain: -3 } },
-  { id: '3', type: 'Highshelf', channel: 0, enabled: false, params: { freq: 10000, gain: 2 } },
-  { id: '4', type: 'Lowpass',   channel: 1, enabled: true,  params: { freq: 18000, q: 0.707 } },
+// Filtros y sub-tipos de biquad soportados por CamillaDSP 4.x. Para
+// referencia: https://henquist.github.io/camilladsp.html#filters
+const SUPPORTED_FILTER_TYPES = [
+  'Biquad', 'BiquadCombo', 'Conv', 'Compressor', 'Limiter',
+  'Gain', 'Volume', 'Loudness', 'Delay', 'DiffEq',
 ]
 
-function FilterRow({ filter }: { filter: Filter }) {
+const BIQUAD_SUBTYPES = [
+  'Peaking', 'Highshelf', 'Lowshelf', 'Highpass', 'Lowpass',
+  'Notch', 'Allpass', 'Bandpass', 'LinkwitzTransform',
+]
+
+function paramSummary(params: Record<string, unknown>): string {
+  const keys = ['freq', 'frequency', 'q', 'gain', 'slope', 'threshold', 'ratio', 'attack', 'release']
+  const pieces: string[] = []
+  for (const k of keys) {
+    if (params[k] !== undefined) {
+      const v = params[k]
+      pieces.push(`${k}: ${typeof v === 'number' ? Number(v).toFixed(1) : String(v)}`)
+    }
+  }
+  return pieces.join('  ·  ')
+}
+
+function FilterRow({ filter }: { filter: ConfiguredFilter }) {
   const [expanded, setExpanded] = useState(false)
   const color = FILTER_COLORS[filter.type] ?? '#505070'
+  const subtype = filter.subtype ?? (filter.params.type as string | undefined)
 
   return (
-    <div className={`rounded-lg border transition-all ${
-      filter.enabled ? 'border-[#252540] bg-[#12121f]' : 'border-[#1a1a2e] bg-[#0f0f1a] opacity-50'
-    }`}>
+    <div className="rounded-lg border border-[#252540] bg-[#12121f]">
       <div
         className="flex items-center gap-3 px-3 py-2.5 cursor-pointer select-none"
         onClick={() => setExpanded(e => !e)}
       >
-        {/* Color dot */}
         <div className="w-2 h-2 rounded-full flex-shrink-0" style={{ background: color }} />
-
-        {/* Type badge */}
         <span
           className="text-[10px] font-semibold px-2 py-0.5 rounded-md"
           style={{ background: `${color}18`, color }}
         >
-          {filter.type}
+          {filter.type}{subtype ? ` · ${subtype}` : ''}
         </span>
-
-        {/* Params summary */}
-        <span className="text-xs text-[#505070] font-mono flex-1">
-          {Object.entries(filter.params).map(([k, v]) =>
-            `${k}: ${typeof v === 'number' ? v.toFixed(0) : v}`
-          ).join('  ·  ')}
+        <span className="text-xs text-[#e8e8ff] font-mono">{filter.name}</span>
+        <span className="text-xs text-[#505070] font-mono flex-1 truncate">
+          {paramSummary(filter.params)}
         </span>
-
-        {/* Channel */}
-        <span className="text-[10px] text-[#505070] bg-[#12121f] border border-[#252540] rounded px-1.5 py-0.5">
-          Ch {filter.channel + 1}
-        </span>
-
         {expanded ? <ChevronDown size={14} className="text-[#505070]" /> : <ChevronRight size={14} className="text-[#505070]" />}
       </div>
-
       {expanded && (
-        <div className="px-4 pb-3 border-t border-[#1a1a2e] pt-3 flex flex-wrap gap-4">
-          {Object.entries(filter.params).map(([key, value]) => (
-            <div key={key} className="flex flex-col gap-1">
-              <span className="text-[10px] text-[#505070] uppercase">{key}</span>
-              <input
-                type="number"
-                defaultValue={value as number}
-                className="w-24 bg-[#0a0a14] border border-[#252540] rounded px-2 py-1 text-sm font-mono text-[#e8e8ff] focus:border-[#6366f1]"
-              />
-            </div>
-          ))}
+        <div className="px-4 pb-3 border-t border-[#1a1a2e] pt-3">
+          <pre className="text-[11px] text-[#9090bb] font-mono leading-relaxed overflow-x-auto">
+{JSON.stringify(filter.params, null, 2)}
+          </pre>
         </div>
       )}
     </div>
   )
 }
 
+function extractFilters(config: CamillaConfig | null): ConfiguredFilter[] {
+  if (!config) return []
+  const raw = (config.filters as Record<string, Record<string, unknown>> | undefined) ?? {}
+  return Object.entries(raw).map(([name, def]) => {
+    const type = String(def.type ?? 'Unknown')
+    const params = (def.parameters as Record<string, unknown> | undefined) ?? {}
+    return { name, type, subtype: params.type as string | undefined, params }
+  })
+}
+
 export function Filters() {
-  const [filters] = useState<Filter[]>(DEMO_FILTERS)
-  const [addType, setAddType] = useState('Peaking')
+  const [config, setConfig] = useState<CamillaConfig | null>(null)
+  const [error, setError]   = useState<string | null>(null)
+  const [loading, setLoading] = useState(false)
+
+  const reload = async () => {
+    setLoading(true)
+    try {
+      const c = await nebulaAPI.getConfig()
+      setConfig(c)
+      setError(null)
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => { reload() }, [])
+
+  const filters = extractFilters(config)
 
   return (
     <div className="flex flex-col gap-5">
       <div className="flex items-center justify-between">
         <h1 className="text-lg font-bold text-[#e8e8ff] tracking-tight">Filters</h1>
-        <div className="flex items-center gap-2">
-          <select
-            value={addType}
-            onChange={e => setAddType(e.target.value)}
-            className="bg-[#12121f] border border-[#252540] rounded-lg px-3 py-1.5 text-sm text-[#9090bb] focus:border-[#6366f1]"
-          >
-            {FILTER_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
-          </select>
-          <button className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-[#6366f1] text-white text-xs font-semibold hover:bg-[#818cf8] transition-colors">
-            <Plus size={14} />
-            Add Filter
-          </button>
-        </div>
+        <button
+          onClick={reload}
+          className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-[#252540] text-xs text-[#9090bb] hover:border-[#6366f1] hover:text-[#818cf8] transition-all"
+        >
+          <RefreshCw size={12} className={loading ? 'animate-spin' : ''} />
+          Refresh
+        </button>
       </div>
 
-      <Card title="Filter Chain" accent="#6366f1">
-        <div className="flex flex-col gap-2">
-          {filters.map(f => <FilterRow key={f.id} filter={f} />)}
-          {filters.length === 0 && (
-            <div className="text-center py-8 text-[#505070] text-sm">
-              No filters configured. Add your first filter above.
+      <Card title={`Filter Chain (${filters.length})`} accent="#6366f1">
+        {error && <div className="text-xs text-[#ef4444] mb-3">Engine no disponible: {error}</div>}
+        {!config && !error && <div className="text-xs text-[#505070]">Cargando…</div>}
+        {config && filters.length === 0 && (
+          <div className="text-center py-8 text-[#505070] text-sm">
+            No hay filtros en el config activo.
+            <div className="text-[11px] mt-1 text-[#303050]">
+              Editor visual de filtros disponible en la próxima versión.
             </div>
-          )}
+          </div>
+        )}
+        <div className="flex flex-col gap-2">
+          {filters.map(f => <FilterRow key={f.name} filter={f} />)}
         </div>
       </Card>
 
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-        {FILTER_TYPES.map(type => (
-          <div
-            key={type}
-            className="flex items-center gap-2 px-3 py-2 rounded-lg border border-[#1a1a2e] bg-[#0f0f1a] cursor-pointer hover:border-[#252540] transition-colors"
-          >
+      <Card title="Tipos de filtro soportados por el engine" accent="#9090bb">
+        <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+          {SUPPORTED_FILTER_TYPES.map(type => (
             <div
-              className="w-2 h-2 rounded-full flex-shrink-0"
-              style={{ background: FILTER_COLORS[type] ?? '#505070' }}
-            />
-            <span className="text-xs text-[#505070]">{type}</span>
-          </div>
-        ))}
-      </div>
+              key={type}
+              className="flex items-center gap-2 px-3 py-2 rounded-lg border border-[#1a1a2e] bg-[#0f0f1a]"
+            >
+              <div
+                className="w-2 h-2 rounded-full flex-shrink-0"
+                style={{ background: FILTER_COLORS[type] ?? '#505070' }}
+              />
+              <span className="text-xs text-[#9090bb]">{type}</span>
+            </div>
+          ))}
+        </div>
+        <div className="mt-3 text-[10px] text-[#505070] leading-relaxed">
+          Sub-tipos Biquad: {BIQUAD_SUBTYPES.join(', ')}.
+        </div>
+      </Card>
     </div>
   )
 }

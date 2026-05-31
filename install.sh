@@ -126,6 +126,19 @@ else
   PLAYBACK_DEVICE="default"
 fi
 
+# Detectar formato soportado por la placa (S32_LE para DACs hi-end,
+# S16_LE para auriculares/headsets USB de consumo). Si no podemos
+# detectarlo, S16_LE es seguro en cualquier dispositivo USB Audio Class 1.
+DEFAULT_FORMAT="S16_LE"
+if [[ -n "$USB_CARD" ]]; then
+  if arecord --dump-hw-params -D "hw:$USB_CARD,0" 2>/dev/null | grep -q "S32_LE"; then
+    DEFAULT_FORMAT="S32_LE"
+  elif arecord --dump-hw-params -D "hw:$USB_CARD,0" 2>/dev/null | grep -q "S24_3LE"; then
+    DEFAULT_FORMAT="S24_3LE"
+  fi
+  ok "Formato de muestra: $DEFAULT_FORMAT"
+fi
+
 # ════════════════════════════════════════════════════════════════════════════
 # 4. Dependencias del sistema
 # ════════════════════════════════════════════════════════════════════════════
@@ -327,11 +340,23 @@ EOF
 mkdir -p "$INSTALL_DIR/backend/config"
 ln -sf "$CONFIG_DIR/camillagui.yml" "$INSTALL_DIR/backend/config/camillagui.yml"
 
-# State file
-cat > "$CONFIG_DIR/statefile.yml" << 'EOF'
-volume: -20.0
-mute: false
+# Statefile que camilladsp persiste con `-s`: contiene el config activo
+# y los gains. CamillaDSP lo crea/actualiza solo en cada cambio; lo
+# pre-creamos con default.yml como config activo para que al primer
+# arranque tras reboot el engine cargue automáticamente y la GUI no se
+# vea en estado INACTIVE.
+cat > "$CONFIG_DIR/statefile.yml" << EOF
+---
+config_path: $CONFIG_DIR/configs/default.yml
+mute: [false, false, false, false, false]
+volume: [0.0, 0.0, 0.0, 0.0, 0.0]
 EOF
+
+# Logfile del engine: separado del statefile para evitar que camilladsp
+# clobbere el statefile con sus logs (bug original: -o apuntaba al
+# statefile, lo que dejaba el engine sin persistencia y la GUI en
+# estado INACTIVE).
+install -m 0644 -o "$REAL_USER" -g "$REAL_GROUP" /dev/null /var/log/nebula-dsp-engine.log
 
 # Config de audio por defecto
 cat > "$CONFIG_DIR/configs/default.yml" << EOF
@@ -345,12 +370,12 @@ devices:
     type: Alsa
     channels: 2
     device: "$CAPTURE_DEVICE"
-    format: S32_LE
+    format: $DEFAULT_FORMAT
   playback:
     type: Alsa
     channels: 2
     device: "$PLAYBACK_DEVICE"
-    format: S32_LE
+    format: $DEFAULT_FORMAT
 
 mixers: {}
 filters: {}
@@ -375,7 +400,14 @@ After=sound.target
 Wants=sound.target
 
 [Service]
-ExecStart=$BIN_PATH -p 1234 -w $CONFIG_DIR/configs/default.yml -o $CONFIG_DIR/statefile.yml
+# Flags:
+#   -p 1234                              WebSocket de control
+#   -s <statefile>                       Persiste config activo + gains entre reinicios
+#   -o <logfile>                         Logs del engine (separado del statefile)
+#   <CONFIGFILE>                         Config inicial; statefile tiene prioridad si existe
+# Importante: NO usar -w, porque hace que el engine se quede esperando
+# config por websocket y la GUI muestre INACTIVE indefinidamente.
+ExecStart=$BIN_PATH -p 1234 -s $CONFIG_DIR/statefile.yml -o /var/log/nebula-dsp-engine.log $CONFIG_DIR/configs/default.yml
 Restart=always
 RestartSec=2
 User=$REAL_USER

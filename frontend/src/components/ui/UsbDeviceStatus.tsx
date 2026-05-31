@@ -9,6 +9,17 @@ interface DeviceInfo {
   playback: string
 }
 
+// Devices que el host integra siempre (built-in chipset audio, HDMI,
+// loopbacks de software). Si el primer ALSA card que aparece NO está en
+// esta lista, asumimos que es un dispositivo USB externo conectado.
+const BUILTIN_KEYWORDS = ['PCH', 'HDMI', 'pipewire', 'pulse', 'default', 'null', 'jack']
+
+function isUsbCard(id: string, label: string): boolean {
+  if (!id || !id.startsWith('hw:')) return false
+  const haystack = `${id} ${label}`.toLowerCase()
+  return !BUILTIN_KEYWORDS.some(kw => haystack.includes(kw.toLowerCase()))
+}
+
 export function UsbDeviceStatus() {
   const [status, setStatus]   = useState<UsbStatus>('checking')
   const [device, setDevice]   = useState<DeviceInfo | null>(null)
@@ -21,24 +32,29 @@ export function UsbDeviceStatus() {
     const check = async () => {
       if (!active) return
       try {
-        const config = await nebulaAPI.getConfig()
-        const devices = (config?.devices as Record<string, unknown>) ?? {}
-        const cap  = (devices.capture  as Record<string, unknown>)?.device as string ?? ''
-        const pb   = (devices.playback as Record<string, unknown>)?.device as string ?? ''
+        // /api/status reporta los devices ALSA cacheados por el backend
+        // (refrescados cada vez que un endpoint los pide). Es la fuente
+        // de verdad — no el config guardado, que puede estar vacío si
+        // todavía no se cargó ninguno.
+        const status = await nebulaAPI.getStatus()
+        const playback = (status.playback_devices?.Alsa ?? []) as [string, string][]
+        const capture  = (status.capture_devices?.Alsa  ?? []) as [string, string][]
 
-        const isUsb = cap.startsWith('hw:') && cap !== 'default'
+        const usbPb  = playback.find(([id, name]) => isUsbCard(id, name))
+        const usbCap = capture.find(([id, name])  => isUsbCard(id, name))
 
-        if (isUsb) {
-          // Detectar cambio de dispositivo
-          if (prevDevice && prevDevice !== cap) {
+        if (usbPb || usbCap) {
+          const capId = usbCap?.[0] ?? ''
+          const pbId  = usbPb?.[0]  ?? ''
+          if (prevDevice && prevDevice !== capId) {
             setStatus('changed')
             setFlash(true)
             setTimeout(() => setFlash(false), 3000)
           } else {
             setStatus('detected')
           }
-          setDevice({ capture: cap, playback: pb })
-          setPrev(cap)
+          setDevice({ capture: capId, playback: pbId })
+          setPrev(capId)
         } else {
           setStatus('missing')
           setDevice(null)
