@@ -135,7 +135,7 @@ export function Pipeline() {
         {
           id: 'nebula-limiter',
           type: 'limiter' as NodeType,
-          label: 'Brickwall',
+          label: 'Limiter',
           detail: `${(limiter.ceiling_db ?? -1).toFixed(1)} dBFS · ${limiter.lookahead_ms?.toFixed(0) ?? 3} ms LA`,
         },
         ...baseNodes.slice(-1),
