@@ -229,6 +229,29 @@ class AlsaScanner:
             snd_path = Path(f"/dev/snd/pcmC{device.card_id}D{device.device_id}p")
             return snd_path.exists()
 
+    def probe_best_format(self, device: AudioDevice) -> str:
+        """Pregunta a ALSA qué formatos soporta este device y devuelve el
+        mejor disponible (preferencia: S32_LE > S24_3LE > S16_LE).
+
+        Esto evita que el engine quede en restart-loop tras hot-swap
+        cuando el USB nuevo no soporta el formato que tenía configurado
+        el dispositivo anterior (típico al cambiar entre un headset
+        consumer S16_LE-only y una interface pro S32_LE-only)."""
+        try:
+            result = subprocess.run(
+                ["arecord", "--dump-hw-params", "-D", device.capture_device, "-f", "cd"],
+                capture_output=True, timeout=2, text=True,
+            )
+            combined = result.stdout + result.stderr
+            for fmt in ("S32_LE", "S24_3LE", "S16_LE"):
+                if fmt in combined:
+                    return fmt
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        # Fallback seguro: S16_LE es universalmente soportado por USB Audio
+        # Class 1.x devices.
+        return "S16_LE"
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # Gestión de configuración YAML
@@ -254,10 +277,16 @@ class ConfigManager:
         tmp_path.replace(self.path)
         log.debug("Config guardada: %s", self.path)
 
-    def update_audio_device(self, device: AudioDevice) -> bool:
+    def update_audio_device(self, device: AudioDevice, sample_format: Optional[str] = None) -> bool:
         """
         Actualiza capture y playback device en la config.
         Retorna True si hubo cambios reales.
+
+        Si `sample_format` viene seteado (típicamente desde
+        AlsaScanner.probe_best_format), también lo escribe en
+        devices.capture.format y devices.playback.format — necesario al
+        hacer hot-swap entre placas que no comparten el formato (p.ej.
+        un headset S16_LE-only y una interface pro S32_LE-only).
         """
         try:
             config = self.load()
@@ -269,25 +298,33 @@ class ConfigManager:
         capture  = devices_section.get("capture",  {})
         playback = devices_section.get("playback", {})
 
-        old_cap = capture.get("device",  "")
-        old_pb  = playback.get("device", "")
+        old_cap     = capture.get("device",  "")
+        old_pb      = playback.get("device", "")
+        old_cap_fmt = capture.get("format",  "")
+        old_pb_fmt  = playback.get("format", "")
 
-        if old_cap == device.capture_device and old_pb == device.playback_device:
-            log.info("Dispositivo sin cambios: %s", device.capture_device)
+        new_fmt = sample_format or old_cap_fmt or "S16_LE"
+
+        if (old_cap == device.capture_device and old_pb == device.playback_device
+                and old_cap_fmt == new_fmt and old_pb_fmt == new_fmt):
+            log.info("Dispositivo sin cambios: %s (%s)", device.capture_device, new_fmt)
             return False
 
-        # Actualizar dispositivos manteniendo el resto de la config
+        # Actualizar dispositivos + formato manteniendo el resto de la config
         capture["device"]  = device.capture_device
         playback["device"] = device.playback_device
+        if sample_format:
+            capture["format"]  = sample_format
+            playback["format"] = sample_format
         devices_section["capture"]  = capture
         devices_section["playback"] = playback
         config["devices"] = devices_section
 
         self.save(config)
         log.info(
-            "Config actualizada: capture %s → %s | playback %s → %s",
-            old_cap, device.capture_device,
-            old_pb, device.playback_device,
+            "Config actualizada: capture %s/%s → %s/%s | playback %s/%s → %s/%s",
+            old_cap, old_cap_fmt, device.capture_device, new_fmt,
+            old_pb,  old_pb_fmt,  device.playback_device, new_fmt,
         )
         return True
 
@@ -455,8 +492,15 @@ class UsbAudioWatcher:
                 log.error("Dispositivo inaccesible, abortando reconfiguración")
                 return
 
-        # Actualizar config YAML
-        changed = self.config.update_audio_device(device)
+        # Detectar el formato soportado por el dispositivo nuevo.  Si la
+        # config tenía S16_LE de un headset previo y ahora viene una
+        # interface S32_LE-only (o viceversa), el engine entraría en
+        # restart-loop con "snd_pcm_hw_params_set_format / Invalid argument".
+        sample_format = self.scanner.probe_best_format(device)
+        log.info("Formato soportado por %s: %s", device.capture_device, sample_format)
+
+        # Actualizar config YAML (device + format)
+        changed = self.config.update_audio_device(device, sample_format=sample_format)
         self._current_device = device
 
         if not changed:
@@ -464,7 +508,7 @@ class UsbAudioWatcher:
             return
 
         # Recargar engine
-        log.info("Recargando engine con nuevo dispositivo: %s", device)
+        log.info("Recargando engine con nuevo dispositivo: %s (%s)", device, sample_format)
         success = await self.client.reload_config()
 
         if success:
@@ -501,9 +545,25 @@ class UsbAudioWatcher:
             await self._handle_device_removed(udev_device)
 
     async def _event_loop(self) -> None:
-        """Loop principal que escucha eventos udev."""
+        """Loop principal que escucha eventos udev con debounce.
+
+        Un plug/unplug físico genera varios eventos udev consecutivos en
+        rápida sucesión (uno por cada subdevice ALSA + interfaces USB).
+        La versión anterior cancelaba el handler en curso con cada nuevo
+        evento — y dado que el handler hace `await asyncio.sleep(2.5)` de
+        settle, NUNCA llegaba a completar si los eventos llegaban a
+        intervalos < 2.5 s. Resultado: el watcher detectaba el plug,
+        loggeaba "conectado", pero no llegaba a actualizar la config ni
+        a recargar el engine.
+
+        Nueva estrategia: coalescer eventos en una ventana DEBOUNCE_S.
+        Cada evento nuevo resetea el timer; el handler se ejecuta solo
+        después de que pase la ventana sin eventos adicionales — eso
+        garantiza que cuando arranca, ALSA + udev ya se estabilizaron.
+        """
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue()
+        DEBOUNCE_S = 0.5    # ventana de coalescing
 
         def _on_event(device):
             loop.call_soon_threadsafe(queue.put_nowait, (device.action, device))
@@ -514,15 +574,35 @@ class UsbAudioWatcher:
 
         try:
             while True:
+                # Block hasta que llegue al menos un evento
                 action, device = await queue.get()
-                log.debug("udev evento: %s — %s", action, device.sys_name)
 
-                # Cancelar tarea pendiente si llega nuevo evento rápido
+                # Coalescing: drenar cualquier evento adicional que llegue
+                # dentro de DEBOUNCE_S. Si llega otro mientras esperamos,
+                # extendemos la ventana — clásica debounce de "ultimo
+                # evento gana".
+                last = (action, device)
+                while True:
+                    try:
+                        nxt = await asyncio.wait_for(queue.get(), timeout=DEBOUNCE_S)
+                        last = nxt    # extender ventana
+                    except asyncio.TimeoutError:
+                        break        # ventana sin más eventos → procesar
+
+                final_action, final_device = last
+                log.debug("udev evento (coalescido): %s — %s",
+                          final_action, final_device.sys_name)
+
+                # Esperar si hay un handler previo todavía corriendo (raro
+                # tras el debounce, pero defensivo).
                 if self._pending_task and not self._pending_task.done():
-                    self._pending_task.cancel()
+                    try:
+                        await self._pending_task
+                    except Exception:
+                        pass
 
                 self._pending_task = asyncio.create_task(
-                    self._process_event(action, device)
+                    self._process_event(final_action, final_device)
                 )
         finally:
             observer.stop()
