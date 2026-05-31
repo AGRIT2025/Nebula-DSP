@@ -121,6 +121,8 @@ class MeasurementEngine:
         silence_post:    float          = 1.0,
         output_device:   Optional[int]  = None,
         input_device:    Optional[int]  = None,
+        alsa_device:     Optional[str]  = None,   # e.g. "hw:1,0" — bypasses sounddevice/JACK
+        alsa_format:     Optional[str]  = None,   # e.g. "S32_LE"
     ):
         self.sample_rate    = sample_rate
         self.sweep_duration = sweep_duration
@@ -128,6 +130,8 @@ class MeasurementEngine:
         self.silence_post   = silence_post
         self.output_device  = output_device
         self.input_device   = input_device
+        self.alsa_device    = alsa_device
+        self.alsa_format    = alsa_format or "S32_LE"
 
     def _generate_sweep(self):
         """Return (full_signal, raw_sweep) as float32 numpy arrays."""
@@ -147,7 +151,6 @@ class MeasurementEngine:
 
     async def measure(self, progress_cb: Optional[ProgressCallback] = None) -> MeasurementResult:
         """Play sweep, record simultaneously, deconvolve → IR → FFT."""
-        import sounddevice as sd
         import numpy as np
 
         signal, sweep = self._generate_sweep()
@@ -159,21 +162,20 @@ class MeasurementEngine:
 
         await prog(5, "Generating sweep signal…")
 
-        loop = asyncio.get_event_loop()
-
-        def _playrec():
-            rec = sd.playrec(
-                signal.reshape(-1, 1),
-                samplerate=self.sample_rate,
-                channels=1,
-                dtype="float32",
-                device=(self.input_device, self.output_device),
-            )
-            sd.wait()
-            return rec.flatten()
-
         await prog(10, "Playing sweep and recording…")
-        recording = await loop.run_in_executor(None, _playrec)
+        # Two playback paths:
+        #   1. ALSA-direct via aplay/arecord subprocesses (preferred when
+        #      we know the engine's hw:X,Y device). Bypasses sounddevice
+        #      entirely — no JACK/PipeWire interference. The sweep is
+        #      guaranteed to come out of the configured USB DAC and the
+        #      mic input is guaranteed to be the USB input.
+        #   2. Fallback to sounddevice's playrec for setups where we
+        #      don't have an ALSA device string (e.g. user picked a
+        #      device explicitly from the GUI dropdown).
+        if self.alsa_device:
+            recording = await self._playrec_alsa_direct(signal)
+        else:
+            recording = await self._playrec_sounddevice(signal)
 
         await prog(60, "Deconvolving impulse response…")
         start = n_pre
@@ -193,6 +195,153 @@ class MeasurementEngine:
             impulse_response=ir.tolist(),
             sample_rate=self.sample_rate,
         )
+
+    async def _playrec_sounddevice(self, signal):
+        """Fallback playback/record via sounddevice (PortAudio).
+
+        Used when no ALSA device string is provided. Reliable only when
+        the configured device index/name maps to a working hostapi —
+        with PipeWire+JACK-only sounddevice builds this often falls
+        back to the system default sink. The ALSA-direct path
+        (_playrec_alsa_direct) is preferred for USB audio interfaces.
+        """
+        import sounddevice as sd
+        loop = asyncio.get_event_loop()
+
+        def _playrec():
+            rec = sd.playrec(
+                signal.reshape(-1, 1),
+                samplerate=self.sample_rate,
+                channels=1,
+                dtype="float32",
+                device=(self.input_device, self.output_device),
+            )
+            sd.wait()
+            return rec.flatten()
+
+        return await loop.run_in_executor(None, _playrec)
+
+    async def _playrec_alsa_direct(self, signal):
+        """Play sweep + capture mic via raw ALSA (aplay/arecord subprocesses).
+
+        Sounddevice / PortAudio on PipeWire systems often exposes USB
+        devices ONLY via the JACK hostapi (which delegates back through
+        PipeWire). When JACK isn't running or refuses the open, sounddevice
+        silently falls back to the system default sink — which on this
+        target ends up being the laptop's built-in PCH audio. The user
+        then hears the sweep on the laptop speakers instead of the USB
+        DAC they configured for Nebula. Direct ALSA via subprocess
+        eliminates that whole layer: aplay opens hw:X,Y or fails.
+
+        Synchronisation: aplay and arecord are started in parallel,
+        both with `--buffer-size` constrained so latency is low; we then
+        wait on both. Because aplay needs a header it reads from a WAV
+        file we write to /tmp, and arecord writes its WAV there too.
+        """
+        import asyncio as _asyncio
+        import os
+        import struct
+        import tempfile
+        import wave
+
+        import numpy as np
+
+        # Write the sweep signal as a WAV file at the engine's preferred format.
+        sample_rate = self.sample_rate
+        n_total = len(signal)
+        record_duration_s = (n_total / sample_rate) + 0.3   # tail margin
+
+        tmpdir = tempfile.mkdtemp(prefix="nebula-rc-")
+        sweep_path = os.path.join(tmpdir, "sweep.wav")
+        capture_path = os.path.join(tmpdir, "capture.wav")
+
+        # Encode sweep as S32_LE / S24_3LE / S16_LE depending on alsa_format.
+        # WAV samples are signed integers; we scale the float32 [-1, 1] up.
+        fmt = self.alsa_format
+        if fmt == "S32_LE":
+            sample_width, scale = 4, (2**31 - 1)
+        elif fmt == "S24_3LE":
+            sample_width, scale = 3, (2**23 - 1)
+        else:                   # S16_LE
+            sample_width, scale = 2, (2**15 - 1)
+
+        with wave.open(sweep_path, "wb") as wf:
+            wf.setnchannels(2)     # most USB DACs require stereo
+            wf.setsampwidth(sample_width)
+            wf.setframerate(sample_rate)
+            stereo = np.stack([signal, signal], axis=1)
+            ints = np.clip(stereo * scale, -scale, scale).astype("<i4")
+            if sample_width == 4:
+                wf.writeframes(ints.tobytes())
+            elif sample_width == 3:
+                # 24-bit packed: take 3 LSBytes of each i32
+                packed = ints.astype("<i4").view("u1").reshape(-1, 4)[:, :3].tobytes()
+                wf.writeframes(packed)
+            else:
+                wf.writeframes(ints.astype("<i2").tobytes())
+
+        # Launch aplay + arecord in parallel.  arecord first so it's
+        # capturing by the time aplay starts emitting; the small lead-in
+        # silence (silence_pre) covers the alignment slop.
+        record_cmd = [
+            "arecord",
+            "-D", self.alsa_device,
+            "-f", fmt,
+            "-r", str(sample_rate),
+            "-c", "2",
+            "-d", str(int(record_duration_s) + 1),
+            capture_path,
+        ]
+        play_cmd = [
+            "aplay",
+            "-D", self.alsa_device,
+            sweep_path,
+        ]
+
+        rec_proc = await _asyncio.create_subprocess_exec(
+            *record_cmd,
+            stdout=_asyncio.subprocess.DEVNULL,
+            stderr=_asyncio.subprocess.PIPE,
+        )
+        await _asyncio.sleep(0.15)   # let arecord prime
+        play_proc = await _asyncio.create_subprocess_exec(
+            *play_cmd,
+            stdout=_asyncio.subprocess.DEVNULL,
+            stderr=_asyncio.subprocess.PIPE,
+        )
+
+        play_rc = await play_proc.wait()
+        rec_rc  = await rec_proc.wait()
+
+        # If aplay failed, surface a clear error.
+        if play_rc != 0:
+            err = (await play_proc.stderr.read()).decode("utf-8", errors="replace")
+            raise RuntimeError(f"aplay -D {self.alsa_device} failed (rc={play_rc}): {err.strip()}")
+
+        # Read back the captured WAV and downmix to mono.
+        with wave.open(capture_path, "rb") as wf:
+            n_frames = wf.getnframes()
+            raw = wf.readframes(n_frames)
+            ch = wf.getnchannels()
+            sw = wf.getsampwidth()
+        if sw == 4:
+            arr = np.frombuffer(raw, dtype="<i4").astype("float32") / (2**31 - 1)
+        elif sw == 3:
+            # 24-bit packed back to i32
+            buf = np.frombuffer(raw, dtype="u1").reshape(-1, 3)
+            i32 = np.zeros(len(buf), dtype="<i4")
+            i32_view = i32.view("u1").reshape(-1, 4)
+            i32_view[:, :3] = buf
+            # sign extension
+            mask = (i32 & 0x800000).astype(bool)
+            i32[mask] |= 0xFF000000
+            arr = i32.astype("float32") / (2**23 - 1)
+        else:
+            arr = np.frombuffer(raw, dtype="<i2").astype("float32") / (2**15 - 1)
+
+        if ch == 2:
+            arr = arr.reshape(-1, 2).mean(axis=1)
+        return arr
 
     def _deconvolve(self, recording, sweep):
         """Wiener deconvolution in frequency domain."""

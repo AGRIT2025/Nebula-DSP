@@ -220,6 +220,32 @@ def _resolve_engine_device_indices():
     return in_idx, out_idx
 
 
+def _resolve_engine_alsa_string() -> tuple[Optional[str], Optional[str]]:
+    """Returns (alsa_device, alsa_format) — e.g. ("hw:1,0", "S32_LE") —
+    from the engine's active config. The ALSA-direct path in
+    MeasurementEngine uses these to bypass sounddevice / PortAudio /
+    JACK entirely, which is the only reliable way to ensure the sweep
+    actually reaches the USB DAC on PipeWire systems where sounddevice
+    falls back to the laptop speakers."""
+    try:
+        import yaml
+    except ImportError:
+        return None, None
+    try:
+        with open(_config_path()) as f:
+            cfg = yaml.safe_load(f) or {}
+    except Exception:
+        return None, None
+    devs = cfg.get("devices") or {}
+    pb   = devs.get("playback") or {}
+    cap  = devs.get("capture") or {}
+    dev  = pb.get("device") or cap.get("device") or ""
+    fmt  = pb.get("format")  or cap.get("format")  or "S16_LE"
+    if not dev.startswith("hw:"):
+        return None, None
+    return dev, fmt
+
+
 # ─── Environment helpers ────────────────────────────────────────────────────────
 
 def _config_path() -> str:
@@ -360,6 +386,15 @@ async def handle_start_measure(request: web.Request) -> web.Response:
             output_device = auto_out
             logger.info("RC: auto-selected OUTPUT device #%d (engine's playback)", auto_out)
 
+    # Resolve also the ALSA device + format from the engine's config —
+    # used by MeasurementEngine to bypass sounddevice/PortAudio when the
+    # latter routes through a hostapi that can't deliver to the actual
+    # USB DAC (typical PipeWire+JACK situation where the sweep ends up
+    # at the laptop speakers).
+    alsa_device, alsa_format = _resolve_engine_alsa_string()
+    if alsa_device:
+        logger.info("RC: ALSA-direct route via %s (%s)", alsa_device, alsa_format)
+
     import uuid
     job_id = uuid.uuid4().hex[:12]
     _jobs[job_id] = {
@@ -384,6 +419,8 @@ async def handle_start_measure(request: web.Request) -> web.Response:
                 sample_rate=sample_rate,
                 output_device=output_device,
                 input_device=input_device,
+                alsa_device=alsa_device,
+                alsa_format=alsa_format,
             )
 
             async def on_progress(pct: int, msg: str):
