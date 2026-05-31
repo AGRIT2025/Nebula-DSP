@@ -13,9 +13,9 @@ export default defineConfig({
     alias: { '@': path.resolve(__dirname, './src') },
   },
   server: {
-    proxy: {
-      '/api/rc': 'http://localhost:5006',
-      '/api':    'http://localhost:5005',
-    },
+    // Tras la consolidación, todo el backend Python corre en el puerto 5005:
+    // /api/*, /api/rc/* (Room Correction), /api/limiter/* (proxy al sidecar).
+    // Ya no hay servidor separado en 5006.
+    proxy: { '/api': 'http://localhost:5005' },
   },
 })

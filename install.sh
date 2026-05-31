@@ -14,7 +14,11 @@ INSTALL_DIR="/opt/nebula-dsp"
 CONFIG_DIR="/etc/nebula-dsp"
 BIN_PATH="/usr/local/bin/camilladsp"
 SERVICE_ENGINE="nebula-engine"
-SERVICE_GUI="nebula-gui"
+# nebula-backend.service: el único service Python tras la consolidación.
+# Antes había 3 (nebula-gui + nebula-usb-watcher + nebula-room-correction);
+# ahora todo vive dentro del mismo aiohttp Application (ver el patch a
+# main.py más abajo). El nombre refleja que ya no es solo "GUI".
+SERVICE_BACKEND="nebula-backend"
 REPO_URL="https://github.com/HEnquist/camilladsp"
 BACKEND_REPO="https://github.com/HEnquist/camillagui-backend"
 
@@ -422,10 +426,14 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-# GUI backend service
-cat > "/etc/systemd/system/${SERVICE_GUI}.service" << EOF
+# nebula-backend service. Tras la consolidación, este único proceso aiohttp
+# corre TODO lo Python: la API del engine (camillagui upstream), Room
+# Correction (/api/rc/*), el USB hot-swap watcher (background task), y el
+# proxy al sidecar Rust del limiter (/api/limiter/*). Es lo que reemplaza
+# a los antiguos nebula-gui + nebula-room-correction + nebula-usb-watcher.
+cat > "/etc/systemd/system/${SERVICE_BACKEND}.service" << EOF
 [Unit]
-Description=Nebula DSP — GUI Backend
+Description=Nebula DSP — Backend (API + Room Correction + USB watcher)
 After=network.target ${SERVICE_ENGINE}.service
 Requires=${SERVICE_ENGINE}.service
 
@@ -433,11 +441,16 @@ Requires=${SERVICE_ENGINE}.service
 # main.py lee la config desde un path hardcodeado en backend/settings.py
 # (BASEPATH/config/camillagui.yml), que apuntamos por symlink a
 # $CONFIG_DIR/camillagui.yml en la sección "Configuración" más arriba.
+# Una sola instancia Python sirve la GUI + RC + USB watcher en el mismo
+# event loop asyncio (ver el patch de main.py más abajo).
 ExecStart=$INSTALL_DIR/venv/bin/python main.py
 WorkingDirectory=$INSTALL_DIR/backend
 Restart=on-failure
 RestartSec=3
 User=$REAL_USER
+Environment="CDSP_HOST=127.0.0.1"
+Environment="CDSP_PORT=1234"
+Environment="NEBULA_CONFIG=$CONFIG_DIR/configs/default.yml"
 StandardOutput=journal
 StandardError=journal
 
@@ -448,75 +461,62 @@ EOF
 ok "Servicios systemd creados"
 
 # ════════════════════════════════════════════════════════════════════════════
-# 11. USB Audio Watcher — servicio de hot-swap embebido
+# 11. Módulos Python embebidos en el backend (RC + USB watcher)
 # ════════════════════════════════════════════════════════════════════════════
-section "USB Audio Watcher"
+section "Módulos Python (Room Correction + USB watcher)"
 
-# Copiar el watcher y el módulo de room correction
-cp "$SCRIPT_DIR/usb_watcher.py"          "$INSTALL_DIR/usb_watcher.py"
-cp "$SCRIPT_DIR/room_correction.py"      "$INSTALL_DIR/room_correction.py"
+# Copiar los módulos al INSTALL_DIR. Ya no corren como services aparte:
+# main.py los importa y llama setup(app) sobre la misma aiohttp Application
+# (ver el patch más abajo).
+cp "$SCRIPT_DIR/usb_watcher.py"            "$INSTALL_DIR/usb_watcher.py"
+cp "$SCRIPT_DIR/room_correction.py"        "$INSTALL_DIR/room_correction.py"
 cp "$SCRIPT_DIR/room_correction_server.py" "$INSTALL_DIR/room_correction_server.py"
 chown "$REAL_USER:$REAL_USER" "$INSTALL_DIR/usb_watcher.py" \
       "$INSTALL_DIR/room_correction.py" "$INSTALL_DIR/room_correction_server.py"
 
-# Instalar dependencias Python del watcher
-"$INSTALL_DIR/venv/bin/pip" install --quiet pyudev websockets pyyaml
-ok "Dependencias del watcher instaladas"
+# Deps adicionales necesarias para el USB watcher (pyudev) que no vienen
+# por defecto en camillagui-backend.
+"$INSTALL_DIR/venv/bin/pip" install --quiet pyudev
+ok "Dependencias Python de USB watcher instaladas"
 
 # usb_watcher.py escribe en /var/log/nebula-dsp-usb.log (FileHandler hardcoded).
-# Si no preparamos el archivo, el service falla con PermissionError porque
-# /var/log/ es propiedad de root y el daemon corre como $REAL_USER.
-# Usamos `id -gn` para el grupo así no asumimos que existe un grupo homónimo.
+# Aunque ahora corre dentro del backend, sigue usando el mismo path.
+# /var/log/ es propiedad de root, así que precreamos el archivo con
+# ownership del usuario que corre el backend.
 REAL_GROUP=$(id -gn "$REAL_USER")
 install -m 0644 -o "$REAL_USER" -g "$REAL_GROUP" /dev/null /var/log/nebula-dsp-usb.log
 
-# ── Room Correction service ──────────────────────────────────────────────────
-cat > "/etc/systemd/system/nebula-room-correction.service" << EOF
-[Unit]
-Description=Nebula DSP — Room Correction Server
-After=${SERVICE_ENGINE}.service ${SERVICE_GUI}.service
-Wants=${SERVICE_ENGINE}.service
-
-[Service]
-ExecStart=$INSTALL_DIR/venv/bin/python $INSTALL_DIR/room_correction_server.py --host 127.0.0.1 --port 5006
-WorkingDirectory=$INSTALL_DIR
-Environment="CDSP_HOST=127.0.0.1"
-Environment="CDSP_PORT=1234"
-Environment="NEBULA_CONFIG=$CONFIG_DIR/configs/default.yml"
-Restart=on-failure
-RestartSec=5
-User=$REAL_USER
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-ok "Servicio nebula-room-correction creado"
-
-# Servicio systemd para el watcher
-cat > "/etc/systemd/system/nebula-usb-watcher.service" << EOF
-[Unit]
-Description=Nebula DSP — USB Audio Device Watcher
-After=${SERVICE_ENGINE}.service
-Wants=${SERVICE_ENGINE}.service
-
-[Service]
-ExecStart=$INSTALL_DIR/venv/bin/python $INSTALL_DIR/usb_watcher.py
-Environment="CDSP_HOST=127.0.0.1"
-Environment="CDSP_PORT=1234"
-Environment="NEBULA_CONFIG=$CONFIG_DIR/configs/default.yml"
-Restart=always
-RestartSec=3
-User=$REAL_USER
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-ok "Servicio nebula-usb-watcher creado"
+# Patch a main.py para importar usb_watcher + room_correction_server y
+# llamar sus setup(app). Idempotente: si ya está parcheado, skip.
+python3 - << PYEOF
+import pathlib, sys
+p = pathlib.Path("$INSTALL_DIR/backend/main.py")
+src = p.read_text()
+if "room_correction_server" in src and "usb_watcher" in src:
+    print("  [skip] main.py ya tiene RC + USB watcher consolidados")
+    sys.exit(0)
+needle_imp = "from backend.routes import setup_routes, setup_static_routes"
+add_imp = (
+    "\nimport sys, os"
+    "\nsys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))"
+    "\nimport room_correction_server"
+    "\nimport usb_watcher"
+)
+if needle_imp in src and "import room_correction_server" not in src:
+    src = src.replace(needle_imp, needle_imp + add_imp)
+needle_call = "    setup_static_routes(app)"
+add_call = (
+    "\n    # Nebula DSP: consolidar Room Correction + USB watcher dentro del"
+    "\n    # mismo proceso aiohttp (antes eran 2 services systemd separados)."
+    "\n    room_correction_server.setup(app)"
+    "\n    usb_watcher.setup(app)"
+)
+if needle_call in src and "room_correction_server.setup" not in src:
+    src = src.replace(needle_call, needle_call + add_call)
+p.write_text(src)
+print("  [ok] main.py parcheado: room_correction + usb_watcher consolidados")
+PYEOF
+ok "Backend consolida Room Correction (/api/rc/*) + USB watcher (background task)"
 
 # ════════════════════════════════════════════════════════════════════════════
 # 11.5. Nebula Limiter — sidecar Rust, brickwall con lookahead + true-peak
@@ -637,18 +637,25 @@ fi
 section "Iniciando servicios"
 
 systemctl daemon-reload
-systemctl enable "${SERVICE_ENGINE}.service" "${SERVICE_GUI}.service" \
-                 nebula-usb-watcher.service nebula-room-correction.service \
+# Limpiar units viejos de una instalación anterior pre-consolidación (si los hay).
+for stale in nebula-gui.service nebula-usb-watcher.service nebula-room-correction.service; do
+  if [[ -f "/etc/systemd/system/$stale" ]]; then
+    systemctl disable "$stale" 2>/dev/null || true
+    rm -f "/etc/systemd/system/$stale"
+    info "Removido service obsoleto: $stale"
+  fi
+done
+systemctl daemon-reload
+
+systemctl enable "${SERVICE_ENGINE}.service" "${SERVICE_BACKEND}.service" \
                  nebula-limiter.service 2>/dev/null || true
 
 if [[ -f "$BIN_PATH" ]]; then
   systemctl start "${SERVICE_ENGINE}.service"         || warn "Engine no inició — verificá la config de audio"
   sleep 2
-  systemctl start "${SERVICE_GUI}.service"            || warn "GUI no inició — revisá los logs"
-  systemctl start "nebula-usb-watcher.service"        || warn "USB watcher no inició"
-  systemctl start "nebula-room-correction.service"    || warn "Room Correction server no inició"
+  systemctl start "${SERVICE_BACKEND}.service"        || warn "Backend no inició — revisá los logs"
   [[ -x "$LIMITER_BIN" ]] && systemctl start "nebula-limiter.service" \
-    || warn "Brickwall Limiter no inició (no es crítico — el resto del DSP funciona)"
+    || warn "Brickwall Limiter no inició (opcional — el resto del DSP funciona igual)"
   ok "Servicios iniciados"
 else
   warn "Binario del engine no encontrado — servicios no iniciados"
@@ -662,23 +669,23 @@ echo -e "${BOLD}${GREEN}══════════════════�
 echo -e "${BOLD}${GREEN}  Nebula DSP instalado correctamente${RESET}"
 echo -e "${BOLD}${GREEN}════════════════════════════════════════════════${RESET}"
 echo ""
-echo -e "  ${CYAN}GUI:${RESET}        http://localhost:5005/gui"
+echo -e "  ${CYAN}GUI:${RESET}        http://localhost:5005/"
 echo -e "  ${CYAN}Engine:${RESET}     WebSocket ws://localhost:1234"
 echo -e "  ${CYAN}Config:${RESET}     $CONFIG_DIR/configs/default.yml"
-echo -e "  ${CYAN}Logs:${RESET}       journalctl -u $SERVICE_ENGINE -u $SERVICE_GUI -u nebula-usb-watcher -u nebula-room-correction -f"
+echo -e "  ${CYAN}Logs:${RESET}       journalctl -u $SERVICE_ENGINE -u $SERVICE_BACKEND -u nebula-limiter -f"
 echo ""
 echo -e "  ${YELLOW}USB hot-swap:${RESET} Conectá o desconectá la placa USB en cualquier"
-echo -e "               momento — el watcher detecta el cambio y reconfigura"
-echo -e "               el engine automáticamente sin interrumpir el servicio."
+echo -e "               momento — el watcher (corriendo dentro del backend) detecta"
+echo -e "               el cambio y reconfigura el engine automáticamente."
 echo ""
 echo -e "  ${YELLOW}Nota:${RESET} Cerrá sesión y volvé a entrar para que los cambios"
 echo -e "        de grupo (audio/realtime) tomen efecto."
 echo ""
-echo -e "  ${BOLD}Comandos útiles:${RESET}"
-echo -e "  systemctl status $SERVICE_ENGINE"
-echo -e "  systemctl status $SERVICE_GUI"
-echo -e "  systemctl status nebula-usb-watcher"
-echo -e "  systemctl status nebula-room-correction"
-echo -e "  journalctl -u nebula-room-correction -f"
-echo -e "  journalctl -u nebula-usb-watcher -f"
+echo -e "  ${BOLD}Servicios (3 totales):${RESET}"
+echo -e "  systemctl status $SERVICE_ENGINE        # CamillaDSP audio engine"
+echo -e "  systemctl status $SERVICE_BACKEND       # Python aiohttp (GUI + API + RC + USB watcher)"
+echo -e "  systemctl status nebula-limiter         # Rust brickwall sidecar (opcional)"
+echo ""
+echo -e "  ${BOLD}Logs unificados:${RESET}"
+echo -e "  journalctl -u $SERVICE_BACKEND -f"
 echo ""

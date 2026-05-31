@@ -38,7 +38,7 @@ The installer:
 6. Installs the Python backend in an isolated virtualenv, patches `main.py` to eager-connect to the engine on startup and to register the `/api/limiter/*` proxy
 7. Installs the Rust toolchain (if missing), compiles `nebula-limiter` in release mode, installs the binary
 8. Loads and persists `snd-aloop` so the limiter has a stable capture device
-9. Creates and starts **5 systemd services** (engine, GUI backend, USB watcher, Room Correction server, lookahead limiter)
+9. Creates and starts **3 systemd services** (engine, consolidated backend, lookahead limiter sidecar). Room Correction and USB hot-swap now live inside the same backend process as the GUI API — one Python event loop, one log stream
 10. Copies the pre-built frontend bundle to the static path served at `/gui/`
 
 ### After Installation
@@ -54,20 +54,16 @@ You'll be redirected to `/gui/index.html`. The app uses `HashRouter`, so tab URL
 ### Service Management
 
 ```bash
-# Status
-systemctl status nebula-engine
-systemctl status nebula-gui
-systemctl status nebula-limiter
-systemctl status nebula-usb-watcher
-systemctl status nebula-room-correction
+# Status (3 services total after consolidation)
+systemctl status nebula-engine          # CamillaDSP audio engine
+systemctl status nebula-backend         # aiohttp: GUI + API + Room Correction + USB watcher
+systemctl status nebula-limiter         # Rust brickwall sidecar (optional)
 
-# Live logs
-journalctl -u nebula-engine -u nebula-gui -u nebula-limiter \
-           -u nebula-usb-watcher -u nebula-room-correction -f
+# Live logs (everything Python-side is in one stream now)
+journalctl -u nebula-engine -u nebula-backend -u nebula-limiter -f
 
 # Restart everything
-sudo systemctl restart nebula-engine nebula-gui nebula-limiter \
-                       nebula-usb-watcher nebula-room-correction
+sudo systemctl restart nebula-engine nebula-backend nebula-limiter
 ```
 
 ### Building the Frontend (for developers)
@@ -95,9 +91,9 @@ cargo test --release    # six unit tests: brickwall, bypass, transient, true-pea
 ```
 Nebula-DSP/
 ├── install.sh                         # One-command installer (Linux only)
-├── usb_watcher.py                     # USB audio hot-swap daemon
-├── room_correction.py                 # Acoustic measurement engine
-├── room_correction_server.py          # Room correction HTTP API (port 5006)
+├── usb_watcher.py                     # USB hot-swap — exposes setup(app), runs as background task in backend
+├── room_correction.py                 # Acoustic measurement engine (sweep + Wiener + IIR/FIR design)
+├── room_correction_server.py          # Room correction routes — exposes setup(app) onto the backend
 ├── backend/
 │   └── nebula_limiter_routes.py       # aiohttp proxy → nebula-limiter Unix socket
 ├── nebula-limiter/                    # Rust sidecar: lookahead brickwall limiter
@@ -300,31 +296,38 @@ Fully integrated REW-style measurement and filter generation, automated from the
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│         Nebula DSP Web Interface            │
-│      React 19 · Vite 8 · port 5005/gui      │
-└──────────────────┬──────────────────────────┘
-                   │ HTTP REST  (HashRouter)
-   ┌───────────────┼───────────────────────┐
-   │               │                       │
-┌──▼───────────┐ ┌─▼────────────────┐ ┌────▼──────────────────────┐
-│  CamillaGUI  │ │ Room Correction  │ │ /api/limiter/* (aiohttp   │
-│   backend    │ │ server (aiohttp, │ │   proxy → Unix socket)    │
-│  port 5005   │ │   port 5006)     │ └────┬──────────────────────┘
-│  (aiohttp)   │ └─────────┬────────┘      │
-└──┬───────────┘           │               │  /run/nebula-limiter/
-   │                       │               │       control.sock
-   │ WebSocket (port 1234) │               │
-┌──▼───────────────────────▼──────┐    ┌───▼────────────────────────┐
-│        CamillaDSP Engine        │    │      nebula-limiter        │
-│       (Rust, upstream)          │    │     (Rust, this repo)      │
-│   filters · mixers · processors │    │   lookahead brickwall      │
-└─────────────────────────────────┘    │   + 2× true-peak detect    │
-                │                       └────────────┬───────────────┘
-                ▼                                    ▲
-        ALSA playback → hw:Loopback,0,0 ─── hw:Loopback,1,0 ──→ DAC
+┌──────────────────────────────────────────────────┐
+│  Browser → React (Vite + Tailwind + lucide)      │
+│   HashRouter · http://host:5005/                 │
+└──────────────────────┬───────────────────────────┘
+                       │ HTTP REST + WS (port 5005)
+┌──────────────────────▼───────────────────────────┐
+│  nebula-backend.service (UNA aiohttp Application) │
+│  • static: sirve frontend/dist/ en /gui/          │
+│  • /api/*        — engine control (camillagui)    │
+│  • /api/rc/*     — Room Correction (consolidado)  │
+│  • /api/limiter/* — proxy al sidecar Rust         │
+│  • background task: UsbAudioWatcher (asyncio)     │
+│  • on_startup: eager-connect al engine            │
+└──┬───────────────────────────────────────┬───────┘
+   │ WebSocket port 1234                   │ Unix socket
+┌──▼────────────────────┐         ┌────────▼──────────────────────┐
+│  CamillaDSP engine    │         │  nebula-limiter (opcional)     │
+│  Rust, upstream       │         │  Rust sidecar — Brickwall +    │
+│  nebula-engine.service│         │  2× true-peak detection        │
+│                       │         │  nebula-limiter.service        │
+└───────────────────────┘         └────────────┬───────────────────┘
+            │                                  ▲
+            ▼                                  │
+       ALSA playback → hw:Loopback,0,0 ─── hw:Loopback,1,0 ──→ DAC
                                        (snd-aloop kernel module)
 ```
+
+**Consolidación clave**: antes de v1.1, Room Correction y el USB watcher
+corrían como dos services Python adicionales (`nebula-room-correction` en
+el puerto 5006, `nebula-usb-watcher` como daemon). Ahora ambos viven
+dentro del mismo proceso aiohttp del backend — mismo event loop, mismo
+log, un único endpoint HTTP (5005) para todo.
 
 **Engine launch flags** (`/etc/systemd/system/nebula-engine.service`):
 
@@ -337,15 +340,13 @@ camilladsp -p 1234 \
 
 - `-p` WebSocket port for control · `-s` statefile (persists active config + gains across reboots) · `-o` log file (kept separate from the statefile — early versions had them collide) · positional configfile = boot config (no `-w` because we want the engine to load it on start, not wait)
 
-**Services running after install:**
+**Services running after install (3 total):**
 
 | Service | Description | Port |
 |---|---|---|
 | `nebula-engine` | CamillaDSP audio engine | 1234 (WS) |
-| `nebula-gui` | aiohttp HTTP / API backend + frontend host | 5005 |
-| `nebula-limiter` | Lookahead brickwall sidecar | Unix socket `/run/nebula-limiter/control.sock` |
-| `nebula-usb-watcher` | USB device hot-swap daemon | — |
-| `nebula-room-correction` | Acoustic measurement API | 5006 |
+| `nebula-backend` | aiohttp HTTP/API + frontend host + Room Correction (`/api/rc/*`) + USB hot-swap watcher (asyncio background task) | 5005 |
+| `nebula-limiter` | Rust lookahead brickwall sidecar (optional) | Unix socket `/run/nebula-limiter/control.sock` |
 
 ---
 

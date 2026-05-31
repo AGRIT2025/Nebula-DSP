@@ -1,7 +1,15 @@
 """
-Nebula DSP — USB Audio Device Watcher
-Detecta conexión/desconexión de placas de audio USB y recarga
-el engine CamillaDSP automáticamente con el nuevo dispositivo.
+Nebula DSP — USB Audio Device Watcher.
+
+Detecta conexión/desconexión de placas de audio USB y recarga el
+engine CamillaDSP automáticamente con el nuevo dispositivo.
+
+Usado en dos modos:
+  1. Importado por el backend consolidado: `setup(app)` registra un
+     `on_startup` hook que lanza `UsbAudioWatcher().start()` como
+     `asyncio.create_task()` dentro del mismo event loop de aiohttp.
+  2. Standalone para debug: `python usb_watcher.py` corre el watcher
+     directo (kept for backwards compatibility).
 
 Dependencias: pyudev, websockets, pyyaml
 """
@@ -477,7 +485,50 @@ class UsbAudioWatcher:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Entry point
+# Integration with the consolidated backend
+# ════════════════════════════════════════════════════════════════════════════
+
+async def _supervisor():
+    """Wraps UsbAudioWatcher.start() with the same restart-on-error logic
+    the standalone main() had.  Used by `setup(app)` below."""
+    watcher = UsbAudioWatcher()
+    while True:
+        try:
+            await watcher.start()
+        except asyncio.CancelledError:
+            log.info("Watcher cancelado (shutdown del backend)")
+            raise
+        except Exception as e:
+            log.error("Error inesperado en USB watcher: %s — reintentando en %ss", e, RECONNECT_DELAY)
+            await asyncio.sleep(RECONNECT_DELAY)
+
+
+def setup(app) -> None:  # `app: aiohttp.web.Application` — imported lazily to keep this file
+    """Schedule the USB watcher as a background task next to the API.
+
+    Registers an `on_startup` hook so the supervisor task is created
+    once the event loop is running, and an `on_cleanup` hook to cancel
+    it gracefully on shutdown.
+    """
+    async def _on_startup(_app):
+        log.info("Nebula USB watcher: scheduling background task")
+        _app["_usb_watcher_task"] = asyncio.create_task(_supervisor())
+
+    async def _on_cleanup(_app):
+        task = _app.get("_usb_watcher_task")
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    app.on_startup.append(_on_startup)
+    app.on_cleanup.append(_on_cleanup)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Standalone entry point (kept for `python usb_watcher.py` debugging)
 # ════════════════════════════════════════════════════════════════════════════
 
 async def main():

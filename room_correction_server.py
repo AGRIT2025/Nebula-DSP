@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-Nebula DSP — Room Correction HTTP Server (port 5006)
-Standalone aiohttp server that exposes /api/rc/* endpoints.
+Nebula DSP — Room Correction routes.
 
-Runs alongside the CamillaGUI backend (port 5005).
-The Vite dev proxy routes /api/rc → this server.
-In production the main backend can forward /api/rc requests here.
+Used in two ways:
+  1. Imported by the consolidated nebula-backend (`setup(app)` mounts
+     /api/rc/* onto the shared aiohttp Application — same process as
+     the GUI backend and the USB watcher).
+  2. Run standalone for development with `python room_correction_server.py
+     --port 5006` (the Vite dev proxy used to route /api/rc to a
+     separate process; kept for backwards compatibility).
 """
 
 import asyncio
@@ -240,27 +243,43 @@ async def handle_export(request: web.Request) -> web.Response:
     )
 
 
-# ─── App factory ────────────────────────────────────────────────────────────────
+# ─── Route registration ──────────────────────────────────────────────────────
+
+_ROUTES = (
+    ("GET",  "/api/rc/targets",          handle_targets),
+    ("GET",  "/api/rc/devices",          handle_list_devices),
+    ("POST", "/api/rc/measure",          handle_start_measure),
+    ("GET",  "/api/rc/measure/{job_id}", handle_job_status),
+    ("GET",  "/api/rc/result",           handle_measurement_result),
+    ("POST", "/api/rc/design",           handle_design),
+    ("POST", "/api/rc/apply",            handle_apply),
+    ("POST", "/api/rc/remove",           handle_remove),
+    ("GET",  "/api/rc/export",           handle_export),
+)
+
+
+def setup(app: web.Application) -> None:
+    """Mount /api/rc/* onto an existing aiohttp Application.
+
+    Called from the consolidated nebula-backend's main.py after
+    setup_static_routes(app).  CORS is handled by the main backend
+    (aiohttp_cors), so we do NOT register the cors_middleware here.
+    """
+    for method, path, handler in _ROUTES:
+        app.router.add_route(method, path, handler)
+    logger.info("Room Correction routes mounted (%d endpoints)", len(_ROUTES))
+
 
 def build_app() -> web.Application:
+    """Standalone app factory — kept for `python room_correction_server.py`."""
     app = web.Application(middlewares=[cors_middleware, normalize_path_middleware()])
-
-    app.router.add_get ("/api/rc/targets",          handle_targets)
-    app.router.add_get ("/api/rc/devices",          handle_list_devices)
-    app.router.add_post("/api/rc/measure",          handle_start_measure)
-    app.router.add_get ("/api/rc/measure/{job_id}", handle_job_status)
-    app.router.add_get ("/api/rc/result",           handle_measurement_result)
-    app.router.add_post("/api/rc/design",           handle_design)
-    app.router.add_post("/api/rc/apply",            handle_apply)
-    app.router.add_post("/api/rc/remove",           handle_remove)
-    app.router.add_get ("/api/rc/export",           handle_export)
-
+    setup(app)
     return app
 
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Nebula DSP Room Correction Server")
+    parser = argparse.ArgumentParser(description="Nebula DSP Room Correction Server (standalone dev mode)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5006)
     args = parser.parse_args()
