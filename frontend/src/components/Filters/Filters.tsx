@@ -130,29 +130,55 @@ function dbToY(db: number, h: number): number {
   return h - ((db - DB_MIN) / (DB_MAX - DB_MIN)) * h
 }
 
-function ResponseGraph({ bands, fs }: { bands: ParamFilter[]; fs: number }) {
-  const ref = useRef<HTMLCanvasElement>(null)
+interface ResponseGraphProps {
+  bands:    ParamFilter[]
+  fs:       number
+  onUpdate: (index: number, next: ParamFilter) => void
+}
 
+// Canvas geometry shared by draw + hit-test + drag math.
+const PAD  = { top: 12, right: 16, bottom: 28, left: 44 }
+const CANV = { w: 760, h: 260 }
+const HIT_RADIUS = 12        // px — bigger than visual point so it's easy to grab
+
+function ResponseGraph({ bands, fs, onUpdate }: ResponseGraphProps) {
+  const ref = useRef<HTMLCanvasElement>(null)
+  // Drag state lives in refs so we don't trigger re-renders on every mousemove.
+  const dragIdx  = useRef<number | null>(null)
+  const hoverIdx = useRef<number | null>(null)
+  // bandsRef mirrors the latest `bands` so event handlers can read it
+  // without re-binding (the canvas listeners are bound once on mount).
+  const bandsRef = useRef(bands); bandsRef.current = bands
+  // Tooltip text/anchor for the hovered point — kept in React state so the
+  // overlay div re-renders when it changes.
+  const [tip, setTip] = useState<{ x: number; y: number; text: string } | null>(null)
+
+  const cw = CANV.w - PAD.left - PAD.right
+  const chH = CANV.h - PAD.top  - PAD.bottom
+  const tx = (f: number)  => PAD.left + freqToX(f, cw)
+  const ty = (db: number) => PAD.top  + dbToY(db, chH)
+  const fromX = (x: number) => F_MIN * Math.pow(F_MAX / F_MIN, (x - PAD.left) / cw)
+  const fromY = (y: number) => DB_MAX - ((y - PAD.top) / chH) * (DB_MAX - DB_MIN)
+
+  // Each filter's drag-point lives at (freq, gain).  Non-gain filters
+  // (Highpass / Lowpass / Notch) sit on the 0 dB axis so they still have a
+  // grab handle for freq + Q (wheel).
+  const pointDb = (b: ParamFilter) => usesGain(b.subtype) ? b.gain : 0
+
+  // ── Draw ────────────────────────────────────────────────────────────────
   useEffect(() => {
     const canvas = ref.current; if (!canvas) return
     const ctx = canvas.getContext('2d'); if (!ctx) return
-    const PAD = { top: 12, right: 16, bottom: 28, left: 44 }
-    const W = canvas.width, H = canvas.height
-    const cw = W - PAD.left - PAD.right
-    const ch = H - PAD.top  - PAD.bottom
-
-    ctx.clearRect(0, 0, W, H)
+    ctx.clearRect(0, 0, CANV.w, CANV.h)
     ctx.fillStyle = '#080810'
-    ctx.fillRect(0, 0, W, H)
+    ctx.fillRect(0, 0, CANV.w, CANV.h)
 
-    const tx = (f: number)  => PAD.left + freqToX(f, cw)
-    const ty = (db: number) => PAD.top  + dbToY(db, ch)
-
-    // Grid + axis labels.
-    ctx.strokeStyle = '#1a1a2e'; ctx.lineWidth = 1
+    // Grid.
+    ctx.lineWidth = 1
     for (const f of GRID_F) {
       const x = tx(f)
-      ctx.beginPath(); ctx.moveTo(x, PAD.top); ctx.lineTo(x, PAD.top + ch); ctx.stroke()
+      ctx.strokeStyle = '#1a1a2e'
+      ctx.beginPath(); ctx.moveTo(x, PAD.top); ctx.lineTo(x, PAD.top + chH); ctx.stroke()
     }
     for (const db of GRID_DB) {
       const y = ty(db)
@@ -162,27 +188,24 @@ function ResponseGraph({ bands, fs }: { bands: ParamFilter[]; fs: number }) {
     ctx.fillStyle = '#505070'; ctx.font = '10px monospace'
     ctx.textAlign = 'center'
     for (let i = 0; i < LABEL_F.length; i++) {
-      ctx.fillText(LABEL_F[i], tx([20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000][i]), PAD.top + ch + 16)
+      ctx.fillText(LABEL_F[i], tx([20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000][i]), PAD.top + chH + 16)
     }
     ctx.textAlign = 'right'
     for (const db of GRID_DB) {
       ctx.fillText(`${db > 0 ? '+' : ''}${db}`, PAD.left - 6, ty(db) + 3)
     }
 
-    // Sample the curves at every pixel column for smooth lines.
-    const xs = cw
-    const sampleF = (px: number) => F_MIN * Math.pow(F_MAX / F_MIN, px / xs)
+    // Curve sampling: one point per output pixel column.
+    const sampleF = (px: number) => F_MIN * Math.pow(F_MAX / F_MIN, px / cw)
 
-    // Per-filter curves (translucent).
     for (const b of bands) {
       if (!b.enabled) continue
       const coeffs = biquadCoeffs(b, fs)
       ctx.strokeStyle = SUBTYPE_COLOR[b.subtype] + '55'
       ctx.lineWidth = 1.2
       ctx.beginPath()
-      for (let px = 0; px <= xs; px++) {
-        const f = sampleF(px)
-        const db = biquadMagnitudeDb(coeffs, f, fs)
+      for (let px = 0; px <= cw; px++) {
+        const db = biquadMagnitudeDb(coeffs, sampleF(px), fs)
         const y = ty(Math.max(DB_MIN, Math.min(DB_MAX, db)))
         if (px === 0) ctx.moveTo(PAD.left + px, y)
         else          ctx.lineTo(PAD.left + px, y)
@@ -190,19 +213,15 @@ function ResponseGraph({ bands, fs }: { bands: ParamFilter[]; fs: number }) {
       ctx.stroke()
     }
 
-    // Combined curve (solid, bright).  Sum of dB per filter at each freq.
     const enabled = bands.filter(b => b.enabled)
     if (enabled.length > 0) {
       const coeffList = enabled.map(b => biquadCoeffs(b, fs))
-      ctx.strokeStyle = '#e8e8ff'
-      ctx.lineWidth = 2
-      ctx.shadowBlur = 6
-      ctx.shadowColor = '#818cf8'
+      ctx.strokeStyle = '#e8e8ff'; ctx.lineWidth = 2
+      ctx.shadowBlur = 6; ctx.shadowColor = '#818cf8'
       ctx.beginPath()
-      for (let px = 0; px <= xs; px++) {
-        const f = sampleF(px)
+      for (let px = 0; px <= cw; px++) {
         let dbTotal = 0
-        for (const c of coeffList) dbTotal += biquadMagnitudeDb(c, f, fs)
+        for (const c of coeffList) dbTotal += biquadMagnitudeDb(c, sampleF(px), fs)
         const y = ty(Math.max(DB_MIN, Math.min(DB_MAX, dbTotal)))
         if (px === 0) ctx.moveTo(PAD.left + px, y)
         else          ctx.lineTo(PAD.left + px, y)
@@ -210,16 +229,148 @@ function ResponseGraph({ bands, fs }: { bands: ParamFilter[]; fs: number }) {
       ctx.stroke()
       ctx.shadowBlur = 0
     }
-  }, [bands, fs])
+
+    // Draggable points.  Drawn LAST so they sit above the curves.
+    for (let i = 0; i < bands.length; i++) {
+      const b = bands[i]
+      if (!b.enabled) continue
+      const x = tx(b.freq)
+      const y = ty(pointDb(b))
+      const color = SUBTYPE_COLOR[b.subtype]
+      const isHover = hoverIdx.current === i || dragIdx.current === i
+
+      // Halo on hover.
+      if (isHover) {
+        ctx.fillStyle = color + '33'
+        ctx.beginPath(); ctx.arc(x, y, 14, 0, Math.PI * 2); ctx.fill()
+      }
+      // Filled point.
+      ctx.fillStyle = color
+      ctx.strokeStyle = '#e8e8ff'
+      ctx.lineWidth = isHover ? 2 : 1
+      ctx.beginPath(); ctx.arc(x, y, 6, 0, Math.PI * 2); ctx.fill(); ctx.stroke()
+    }
+  }, [bands, fs, tip])  // tip dep: re-paint when hover halo toggles
+
+  // ── Hit test ────────────────────────────────────────────────────────────
+  const hitTest = (px: number, py: number): number | null => {
+    const list = bandsRef.current
+    let best = -1, bestD2 = HIT_RADIUS * HIT_RADIUS
+    for (let i = 0; i < list.length; i++) {
+      const b = list[i]
+      if (!b.enabled) continue
+      const x = tx(b.freq), y = ty(pointDb(b))
+      const dx = px - x, dy = py - y
+      const d2 = dx * dx + dy * dy
+      if (d2 < bestD2) { bestD2 = d2; best = i }
+    }
+    return best === -1 ? null : best
+  }
+
+  const pixelFromEvent = (e: { clientX: number; clientY: number }) => {
+    const canvas = ref.current!
+    const rect = canvas.getBoundingClientRect()
+    return {
+      x: ((e.clientX - rect.left) / rect.width)  * CANV.w,
+      y: ((e.clientY - rect.top)  / rect.height) * CANV.h,
+    }
+  }
+
+  // ── Mouse handlers ──────────────────────────────────────────────────────
+  const onMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const { x, y } = pixelFromEvent(e)
+    const idx = hitTest(x, y)
+    if (idx !== null) {
+      dragIdx.current = idx
+      hoverIdx.current = idx
+      e.preventDefault()
+    }
+  }
+  const onMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const { x, y } = pixelFromEvent(e)
+    if (dragIdx.current !== null) {
+      const i = dragIdx.current
+      const b = bandsRef.current[i]
+      const freq = Math.max(F_MIN, Math.min(F_MAX, fromX(x)))
+      const gain = Math.max(DB_MIN, Math.min(DB_MAX, fromY(y)))
+      const next: ParamFilter = {
+        ...b,
+        freq: Math.round(freq * 100) / 100,
+        gain: usesGain(b.subtype) ? Math.round(gain * 10) / 10 : b.gain,
+      }
+      onUpdate(i, next)
+      setTip({
+        x, y,
+        text: `${next.freq < 1000 ? next.freq.toFixed(0) + ' Hz' : (next.freq / 1000).toFixed(2) + ' kHz'} · Q ${b.q.toFixed(2)}${usesGain(b.subtype) ? ' · ' + (next.gain >= 0 ? '+' : '') + next.gain.toFixed(1) + ' dB' : ''}`,
+      })
+      return
+    }
+    const idx = hitTest(x, y)
+    hoverIdx.current = idx
+    if (idx !== null) {
+      const b = bandsRef.current[idx]
+      setTip({
+        x: tx(b.freq),
+        y: ty(pointDb(b)),
+        text: `${b.subtype} · ${b.freq < 1000 ? b.freq.toFixed(0) + ' Hz' : (b.freq / 1000).toFixed(2) + ' kHz'} · Q ${b.q.toFixed(2)}${usesGain(b.subtype) ? ' · ' + (b.gain >= 0 ? '+' : '') + b.gain.toFixed(1) + ' dB' : ''}`,
+      })
+    } else {
+      setTip(null)
+    }
+  }
+  const onMouseUp = () => { dragIdx.current = null }
+  const onMouseLeave = () => { dragIdx.current = null; hoverIdx.current = null; setTip(null) }
+  const onWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
+    const { x, y } = pixelFromEvent(e)
+    const idx = hitTest(x, y)
+    if (idx === null) return
+    e.preventDefault()
+    const b = bandsRef.current[idx]
+    // Scroll up (negative deltaY) → tighter Q (higher value).  Multiplicative
+    // step so movement is even in log-Q space (0.1 → 30 spans ~2.5 decades).
+    const step = e.deltaY < 0 ? 1.1 : 1 / 1.1
+    const nextQ = Math.max(0.1, Math.min(30, b.q * step))
+    onUpdate(idx, { ...b, q: Math.round(nextQ * 1000) / 1000 })
+    setTip({
+      x: tx(b.freq),
+      y: ty(pointDb(b)),
+      text: `Q ${nextQ.toFixed(2)} (${b.subtype})`,
+    })
+  }
 
   return (
-    <canvas
-      ref={ref}
-      width={760}
-      height={260}
-      className="rounded-lg border border-[#252540]"
-      style={{ width: '100%', height: 'auto', aspectRatio: '760/260' }}
-    />
+    <div className="relative">
+      <canvas
+        ref={ref}
+        width={CANV.w}
+        height={CANV.h}
+        onMouseDown={onMouseDown}
+        onMouseMove={onMouseMove}
+        onMouseUp={onMouseUp}
+        onMouseLeave={onMouseLeave}
+        onWheel={onWheel}
+        className="rounded-lg border border-[#252540] select-none"
+        style={{
+          width: '100%', height: 'auto', aspectRatio: `${CANV.w}/${CANV.h}`,
+          cursor: dragIdx.current !== null
+            ? 'grabbing'
+            : hoverIdx.current !== null ? 'grab' : 'crosshair',
+          touchAction: 'none',
+        }}
+      />
+      {tip && (
+        <div
+          className="pointer-events-none absolute px-2 py-1 rounded-md bg-[#0a0a14] border border-[#252540] text-[10px] font-mono text-[#e8e8ff] whitespace-nowrap"
+          style={{
+            left:  `${(tip.x / CANV.w) * 100}%`,
+            top:   `${(tip.y / CANV.h) * 100}%`,
+            transform: 'translate(-50%, -130%)',
+          }}
+        >
+          {tip.text}
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -459,9 +610,9 @@ export function Filters() {
       )}
 
       <Card title="Frequency Response" accent="#818cf8">
-        <ResponseGraph bands={bands} fs={fs} />
+        <ResponseGraph bands={bands} fs={fs} onUpdate={updateBand} />
         <div className="mt-2 flex items-center gap-3 flex-wrap text-[10px] text-[#505070]">
-          <span>Curvas finas = filtros individuales · Curva blanca gruesa = respuesta combinada</span>
+          <span>Arrastrá los puntos para mover freq + gain · Rueda del mouse sobre un punto para ajustar Q</span>
           <span className="ml-auto font-mono">fs = {fs.toLocaleString()} Hz</span>
         </div>
       </Card>
