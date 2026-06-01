@@ -303,7 +303,9 @@ async def _resume_engine_after_measurement() -> None:
             resp = _json.loads(await asyncio.wait_for(ws.recv(), timeout=2))
             cfg_path = (resp.get("GetConfigFilePath") or {}).get("value", "")
             if cfg_path:
-                await ws.send(_json.dumps({"SetConfigFilePath": {"value": cfg_path}}))
+                # CamillaDSP 4.x: Set* takes the value directly, no
+                # {"value": ...} wrapper (verified by direct probe).
+                await ws.send(_json.dumps({"SetConfigFilePath": cfg_path}))
                 await asyncio.wait_for(ws.recv(), timeout=3)
                 logger.info("RC: engine reanudado tras la medición")
                 return

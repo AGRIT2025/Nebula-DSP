@@ -389,7 +389,16 @@ class CamillaDSPClient:
     async def reload_config(self) -> bool:
         """
         Recarga la configuración del engine.
-        CamillaDSP recarga el archivo de config activo si se le envía SetConfigFilePath.
+
+        Protocol (verified against CamillaDSP 4.1.3):
+          - Get* responses: {"GetX": {"result": "Ok", "value": ...}}
+          - Set* arguments: {"SetX": <value-directly>}  (NO {"value": ...} wrapper)
+          - Set* responses: {"SetX": {"result": "Ok"}}
+
+        The earlier code used {"value": ...} on the Set side, which the
+        engine rejected with "invalid type: map, expected a string".
+        The watcher then logged "Respuesta inesperada" and returned
+        False even on otherwise-successful flows.
         """
         # Obtener path del config activo
         resp = await self.send_command({"GetConfigFilePath": None})
@@ -401,8 +410,8 @@ class CamillaDSPClient:
             log.warning("No se pudo obtener el path del config activo")
             return False
 
-        # Recargar enviando el mismo path
-        resp = await self.send_command({"SetConfigFilePath": {"value": config_path}})
+        # Recargar enviando el mismo path como string DIRECTO.
+        resp = await self.send_command({"SetConfigFilePath": config_path})
         if resp and resp.get("SetConfigFilePath", {}).get("result") == "Ok":
             log.info("Config recargada en el engine: %s", config_path)
             return True

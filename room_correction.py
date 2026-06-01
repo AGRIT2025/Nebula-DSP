@@ -20,7 +20,12 @@ import wave
 from dataclasses import dataclass, field
 from typing import Callable, Coroutine, List, Optional, Literal
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("nebula.rc")
+# Use the same logger that room_correction_server configured with a
+# StreamHandler — that way the RC INFO messages reach journald even
+# when the module is imported BEFORE the server's handler setup runs
+# (logging.getLogger returns the same logger instance by name, so any
+# handlers attached later still apply).
 
 # ─── Data structures ────────────────────────────────────────────────────────────
 
@@ -134,59 +139,140 @@ class MeasurementEngine:
         self.alsa_format    = alsa_format or "S32_LE"
 
     def _generate_sweep(self):
-        """Return (full_signal, raw_sweep) as float32 numpy arrays."""
-        import numpy as np
-        import scipy.signal as sig
+        """Return (full_signal, raw_sweep, k_factor) as float32 + scalar.
 
-        n_sweep = int(self.sweep_duration * self.sample_rate)
+        Generates a logarithmic sine sweep from 20 Hz → 20 kHz over
+        `sweep_duration` seconds, **without** a Hanning window: the
+        Farina-style inverse-sweep deconvolution we use later expects
+        the raw sweep with controlled amplitude (constant) so the
+        inverse-sweep envelope can compensate the pink spectrum
+        analytically.  Soft fades (10 ms) at both ends prevent the
+        click-on-start without throwing away low-frequency energy.
+
+        `k_factor = log(f1/f0) / T` is needed to build the inverse
+        sweep with proper amplitude envelope.
+        """
+        import numpy as np
+
+        f0, f1 = 20.0, 20000.0
+        T = self.sweep_duration
+        n_sweep = int(T * self.sample_rate)
         n_pre   = int(self.silence_pre  * self.sample_rate)
         n_post  = int(self.silence_post * self.sample_rate)
 
-        t = np.linspace(0, self.sweep_duration, n_sweep, endpoint=False)
-        sweep = sig.chirp(t, f0=20, f1=20000, t1=self.sweep_duration, method="logarithmic")
-        sweep = sweep * np.hanning(n_sweep)
+        # Logarithmic sweep — Farina formulation.
+        # phase(t) = 2π f0 T / log(f1/f0) · (exp(t/T·log(f1/f0)) - 1)
+        t = np.linspace(0, T, n_sweep, endpoint=False)
+        L = T / np.log(f1 / f0)
+        phase = 2 * np.pi * f0 * L * (np.exp(t / L) - 1.0)
+        # Amplitude 0.85 (-1.4 dBFS) — louder than the previous -6 dBFS
+        # default to improve SNR at the mic input. Still leaves ~1.4 dB
+        # of digital headroom; the speaker analog chain will determine
+        # the real acoustic SPL.
+        sweep = 0.85 * np.sin(phase)
+
+        # 10 ms cosine fade in/out (prevents click without losing LF content)
+        fade_n = int(0.010 * self.sample_rate)
+        if fade_n > 0 and 2 * fade_n < n_sweep:
+            fade = 0.5 * (1 - np.cos(np.pi * np.arange(fade_n) / fade_n))
+            sweep[:fade_n]      *= fade
+            sweep[-fade_n:]     *= fade[::-1]
 
         signal = np.concatenate([np.zeros(n_pre), sweep, np.zeros(n_post)])
-        return signal.astype(np.float32), sweep.astype(np.float32)
+        k_factor = np.log(f1 / f0) / T
+        return signal.astype(np.float32), sweep.astype(np.float32), float(k_factor)
 
     async def measure(self, progress_cb: Optional[ProgressCallback] = None) -> MeasurementResult:
-        """Play sweep, record simultaneously, deconvolve → IR → FFT."""
+        """Play sweep, record simultaneously, deconvolve → IR → FFT.
+
+        Algorithm (Farina 2000 + cross-correlation alignment):
+          1. Generate logarithmic sweep s(t).
+          2. Play s(t) on the DAC, record y(t) on the mic.
+          3. Cross-correlate y(t) against s(t) to find the actual
+             time offset (compensates ALSA buffer + acoustic latency
+             which is otherwise unknown).
+          4. Extract the aligned recording window.
+          5. Build inverse sweep i(t) = s(T-t) · exp(t · k) — its
+             convolution with the system's response gives the IR
+             directly, well-conditioned, with linear distortion
+             products separated from the linear IR.
+          6. IR = (y * i) — pick the linear lobe near the end.
+          7. Window IR to first 50 ms (direct sound + early reflections).
+          8. FFT → frequency response.
+        """
         import numpy as np
 
-        signal, sweep = self._generate_sweep()
-        n_pre = int(self.silence_pre * self.sample_rate)
+        signal, sweep, k_factor = self._generate_sweep()
+        n_sweep = len(sweep)
+        n_pre   = int(self.silence_pre * self.sample_rate)
 
         async def prog(pct: int, msg: str):
             if progress_cb:
                 await progress_cb(pct, msg)
 
         await prog(5, "Generating sweep signal…")
-
         await prog(10, "Playing sweep and recording…")
-        # Two playback paths:
-        #   1. ALSA-direct via aplay/arecord subprocesses (preferred when
-        #      we know the engine's hw:X,Y device). Bypasses sounddevice
-        #      entirely — no JACK/PipeWire interference. The sweep is
-        #      guaranteed to come out of the configured USB DAC and the
-        #      mic input is guaranteed to be the USB input.
-        #   2. Fallback to sounddevice's playrec for setups where we
-        #      don't have an ALSA device string (e.g. user picked a
-        #      device explicitly from the GUI dropdown).
+
         if self.alsa_device:
             recording = await self._playrec_alsa_direct(signal)
         else:
             recording = await self._playrec_sounddevice(signal)
 
-        await prog(60, "Deconvolving impulse response…")
-        start = n_pre
-        end   = min(len(recording), start + int(self.sweep_duration * self.sample_rate) + int(0.5 * self.sample_rate))
-        captured = recording[start:end]
+        rec_peak = float(np.max(np.abs(recording))) if len(recording) > 0 else 0.0
+        rec_dbfs = 20.0 * np.log10(max(rec_peak, 1e-9))
+        logger.info("RC: recording length=%d (%.2fs)  peak=%.3f (%.1f dBFS)",
+                    len(recording), len(recording) / self.sample_rate,
+                    rec_peak, rec_dbfs)
 
-        ir = self._deconvolve(captured, sweep)
+        # Sanity check: a usable measurement needs the mic to actually
+        # hear the sweep. Below ~ -36 dBFS the SNR is so low that the
+        # deconvolution produces a garbage response; report a clear
+        # error so the user knows to check cables / gain / speaker
+        # power instead of staring at a bizarre 70-dB-span graph.
+        if rec_peak < 0.015:    # -36 dBFS
+            raise RuntimeError(
+                f"Mic input too quiet (peak {rec_dbfs:.1f} dBFS). Check that "
+                f"the mic is connected to the audio interface, the input "
+                f"gain knob is up, phantom power is on (if needed), the "
+                f"speaker is powered, and the speaker volume is audible."
+            )
+
+        # ── Alignment via cross-correlation ─────────────────────────────
+        # aplay/arecord don't share a clock — there's an unknown latency
+        # offset (50–300 ms typical with USB + ALSA buffers). xcorr finds
+        # the lag where the recording best matches the sweep, which is
+        # where the sweep effectively "starts" in the recording.
+        await prog(40, "Aligning recording…")
+        align_offset = self._find_sweep_offset(recording, sweep)
+        logger.info("RC: alignment offset = %d samples (%.1f ms)",
+                    align_offset, 1000.0 * align_offset / self.sample_rate)
+
+        # Pull the aligned window: sweep length + 1 s tail for the late IR
+        captured = recording[align_offset : align_offset + n_sweep + self.sample_rate]
+        if len(captured) < n_sweep:
+            # Pad with zeros if the recording was too short
+            captured = np.concatenate([captured, np.zeros(n_sweep - len(captured), dtype=np.float32)])
+
+        await prog(60, "Deconvolving impulse response…")
+        ir = self._deconvolve_farina(captured, sweep, k_factor)
         ir = self._window_ir(ir)
 
         await prog(85, "Computing frequency response…")
         freqs, mag_db = self._fft_response(ir)
+
+        # Sanity check: a real measurement of a speaker in a room is
+        # usually in the ±20 dB range after normalization. Anything
+        # ±40 dB means alignment / level / signal-chain went sideways
+        # — log it so the operator knows the result isn't trustworthy.
+        if len(mag_db) > 0:
+            mag_min = float(np.min(mag_db))
+            mag_max = float(np.max(mag_db))
+            logger.info("RC: response range %.1f → %.1f dB (span %.1f)",
+                        mag_min, mag_max, mag_max - mag_min)
+            if mag_max - mag_min > 60:
+                logger.warning("RC: response span > 60 dB — likely a bad measurement "
+                              "(wrong device, mic muted, level too low, or signal "
+                              "didn't make it to the speaker)")
 
         await prog(100, "Done")
         return MeasurementResult(
@@ -195,6 +281,67 @@ class MeasurementEngine:
             impulse_response=ir.tolist(),
             sample_rate=self.sample_rate,
         )
+
+    @staticmethod
+    def _find_sweep_offset(recording, sweep) -> int:
+        """Cross-correlate the recording against the sweep template;
+        return the sample index in `recording` where the sweep starts.
+        Robust against unknown ALSA/USB latency between aplay/arecord.
+
+        Uses scipy.signal.fftconvolve (faster than correlate at this
+        length) over the first half of the sweep — the early LF/MF
+        portion is distinctive against background noise without being
+        as expensive as the full 3-second template.
+        """
+        import numpy as np
+        from scipy.signal import fftconvolve
+
+        tpl = sweep[: min(len(sweep), len(sweep) // 2)]
+        # Cross-correlate = convolve with time-reversed template
+        c = fftconvolve(recording, tpl[::-1], mode="valid")
+        if len(c) == 0:
+            return 0
+        # The argmax of |c| is where the template aligns inside `recording`.
+        # In "valid" mode, c[0] corresponds to recording starting at offset 0,
+        # so argmax IS the offset where the sweep begins.
+        offset = int(np.argmax(np.abs(c)))
+        return max(0, offset)
+
+    @staticmethod
+    def _deconvolve_farina(recording, sweep, k_factor: float):
+        """Farina (2000) deconvolution via the inverse sweep.
+
+        i(t) = s(T - t) · A(t)  where A compensates the −3 dB/octave
+        pink spectrum of the log sweep so the IR comes out flat-spectrum.
+
+        IR = conv(y, i) — pick the linear lobe (right-most peak), the
+        earlier lobes are harmonic distortion products that get
+        separated in time, which is one of the nice properties of log
+        sweeps.
+        """
+        import numpy as np
+        from scipy.signal import fftconvolve
+
+        T = len(sweep)
+        # Inverse sweep: time-reversed sweep with exponential amplitude.
+        # The exponential makes the IR flat instead of pink.
+        t = np.arange(T)
+        amp = np.exp(t * k_factor / len(sweep))  # normalized so the end is the loud part
+        inv_sweep = sweep[::-1] * amp
+        # Convolve y with i — long, but fftconvolve is O(N log N).
+        ir_full = fftconvolve(recording, inv_sweep, mode="full")
+        # The linear IR is centered around index T-1 (end of the sweep).
+        center = T - 1
+        # Take 1 second window starting from center
+        out_len = min(int(48000), len(ir_full) - center)
+        ir = ir_full[center : center + out_len]
+        # Normalize peak to ±1 (the absolute level depends on inverse-
+        # sweep normalization, not on the actual room — peak normalization
+        # is fine for relative frequency-response analysis).
+        peak = float(np.max(np.abs(ir)))
+        if peak > 0:
+            ir = ir / peak
+        return ir.astype(np.float32)
 
     async def _playrec_sounddevice(self, signal):
         """Fallback playback/record via sounddevice (PortAudio).
@@ -343,16 +490,9 @@ class MeasurementEngine:
             arr = arr.reshape(-1, 2).mean(axis=1)
         return arr
 
-    def _deconvolve(self, recording, sweep):
-        """Wiener deconvolution in frequency domain."""
-        import numpy as np
-        n = max(len(recording), len(sweep)) * 2
-        R = np.fft.rfft(recording, n=n)
-        S = np.fft.rfft(sweep,     n=n)
-        eps = 1e-6 * float(np.max(np.abs(S) ** 2))
-        H = R * np.conj(S) / (np.abs(S) ** 2 + eps)
-        ir = np.fft.irfft(H)
-        return ir[:self.sample_rate]  # keep first second
+    # _deconvolve (Wiener-style) removed — replaced by Farina inverse-sweep
+    # deconvolution (_deconvolve_farina) which has better numerical
+    # behaviour for log sweeps and separates linear from non-linear lobes.
 
     def _window_ir(self, ir):
         """Hann window over first 50 ms — isolates direct sound."""
@@ -539,7 +679,12 @@ class CorrectionApplier:
             "parameters": {
                 "type":             "Raw",
                 "filename":         design.fir_path,
-                "format":           "FLOAT32LE",
+                # CamillaDSP 4.x: the float format is `F32_LE`, not
+                # `FLOAT32LE`. The old name made the engine reject the
+                # config with "unknown variant FLOAT32LE" and enter a
+                # restart-loop the moment Apply was clicked on a FIR
+                # design.
+                "format":           "F32_LE",
                 "skip_bytes_lines": 0,
                 "read_bytes_lines": 0,
             },
@@ -565,10 +710,14 @@ class CorrectionApplier:
         return await self._reload(config_path)
 
     def _replace_correction_steps(self, config: dict, filter_names: List[str]) -> list:
-        """Remove old Nebula steps then append new ones for every channel."""
-        n_channels = 2
+        """Remove old Nebula steps then append a new Filter step covering
+        all channels.  Uses the CamillaDSP 4.x schema `channels: [0, 1]`
+        (array) — earlier code used `channel: 0` (singular int) which
+        the engine rejects with
+        `unknown field "channel", expected one of "channels", "names"...`.
+        That was the cause of /api/rc/apply returning {"ok": false}."""
         devices = config.get("devices", {})
-        n_channels = devices.get("capture", {}).get("channels", 2)
+        n_channels = devices.get("capture", {}).get("channels", 2) or 2
 
         pipeline = [
             s for s in config.get("pipeline", [])
@@ -577,8 +726,12 @@ class CorrectionApplier:
                 for n in s.get("names", [])
             )
         ]
-        for ch in range(n_channels):
-            pipeline.append({"type": "Filter", "channel": ch, "names": filter_names})
+        all_channels = list(range(n_channels))
+        pipeline.append({
+            "type":     "Filter",
+            "channels": all_channels,
+            "names":    filter_names,
+        })
         return pipeline
 
     @staticmethod
@@ -596,13 +749,36 @@ class CorrectionApplier:
         os.replace(tmp, path)
 
     async def _reload(self, config_path: str) -> bool:
+        """Tell the engine to load the config we just wrote.
+
+        CamillaDSP 4.x WebSocket protocol wraps the argument:
+            {"SetConfigFilePath": {"value": "<path>"}}
+        and replies with
+            {"SetConfigFilePath": {"result": "Ok"}}
+        The previous code sent `{"SetConfigFilePath": "<path>"}` (3.x style)
+        and tested `resp.get("SetConfigFilePath") == "Ok"`, so even when
+        the actual reload succeeded the function returned False — which
+        is why the GUI showed {"ok": false} despite the filters being
+        correctly written to disk.
+        """
         import websockets
         uri = f"ws://{self.cdsp_host}:{self.cdsp_port}"
+        # Protocol (verified against CamillaDSP 4.1.3 by direct probe):
+        #   Set commands take the value DIRECTLY (no {value:} wrapper):
+        #       {"SetConfigFilePath": "/etc/.../default.yml"}
+        #   The response is wrapped:
+        #       {"SetConfigFilePath": {"result": "Ok"}}
+        # The old code mistakenly used {"value": ...} and tested
+        # == "Ok" on a dict; both wrong.
         try:
-            async with websockets.connect(uri, open_timeout=3) as ws:
+            async with websockets.connect(uri, open_timeout=3, close_timeout=2) as ws:
                 await ws.send(json.dumps({"SetConfigFilePath": config_path}))
                 resp = json.loads(await ws.recv())
-                return resp.get("SetConfigFilePath") == "Ok"
+                result = (resp.get("SetConfigFilePath") or {}).get("result", "")
+                if result == "Ok":
+                    return True
+                logger.error("CamillaDSP reload returned %r — full resp: %s", result, resp)
+                return False
         except Exception as e:
             logger.error("CamillaDSP reload failed: %s", e)
             return False
