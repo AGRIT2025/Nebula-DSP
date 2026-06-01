@@ -272,6 +272,21 @@ export function Pipeline() {
     }
   }
 
+  const handleStopLimiter = async () => {
+    if (busy) return
+    setBusy(true); setError(null)
+    try {
+      const r = await nebulaAPI.limiterStop()
+      if (!r.ok) throw new Error(r.error || 'systemctl stop failed')
+      // Optimistically clear local state — next poll (≤3 s) confirms.
+      setLimiter(prev => prev ? { ...prev, online: false } : prev)
+    } catch (e) {
+      setError(`Limiter stop: ${e instanceof Error ? e.message : String(e)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const baseNodes = config ? buildPipeline(config) : []
   const nodes = limiter?.online
     ? [
@@ -370,9 +385,13 @@ export function Pipeline() {
                   <PipelineNodeCard
                     node={node}
                     busy={busy}
-                    onDelete={REMOVABLE.has(node.type)
-                      ? () => handleDeleteNode(node)
-                      : undefined}
+                    onDelete={
+                      node.type === 'limiter'
+                        ? handleStopLimiter
+                        : REMOVABLE.has(node.type)
+                          ? () => handleDeleteNode(node)
+                          : undefined
+                    }
                   />
                   {i < nodes.length - 1 && (
                     <ArrowRight size={16} className="text-[#505070] flex-shrink-0" />
@@ -399,9 +418,10 @@ export function Pipeline() {
       </Card>
 
       <div className="rounded-xl border border-dashed border-[#252540] p-4 text-[11px] text-[#505070] leading-relaxed">
-        Pasá el mouse por cualquier nodo del pipeline para ver el botón <kbd className="px-1 py-0.5 bg-[#0a0a14] border border-[#ef444450] text-[#ef4444] rounded">×</kbd> que lo elimina junto con sus filtros/processors huérfanos.
-        El diagrama refleja en tiempo real el YAML del engine (refresco cada 3s).
-        Capture, Playback y el sidecar Limiter no se eliminan desde acá — son estructurales.
+        Pasá el mouse por cualquier nodo eliminable para ver el botón <kbd className="px-1 py-0.5 bg-[#0a0a14] border border-[#ef444450] text-[#ef4444] rounded">×</kbd>.
+        El × en <span className="text-[#ef4444]">Limiter</span> detiene el sidecar (<code className="text-[#a855f7]">systemctl stop nebula-limiter</code>);
+        el × en filtros/processors/mixers borra ese paso del YAML del engine y limpia los huérfanos asociados.
+        Capture y Playback no se borran desde acá — para cambiarlos usá el tab Devices.
       </div>
     </div>
   )

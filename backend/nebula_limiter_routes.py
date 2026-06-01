@@ -86,8 +86,44 @@ async def reset_stats(_request: web.Request):
     return await _handle({"op": "reset_stats"})
 
 
+# ── Service lifecycle (stop / start the Rust sidecar via systemctl) ─────────
+#
+# The Limiter sidecar is a separate systemd unit, not part of the engine's
+# config pipeline. The user can take it out of the audio chain either by
+# clicking the × on the Pipeline diagram's Limiter node or via Start/Stop
+# buttons on the Limiter tab. We shell out to `sudo systemctl ...` —
+# `dsp` has a NOPASSWD entry for this (see install.sh).
+
+_SERVICE = "nebula-limiter.service"
+
+
+async def _systemctl(verb: str):
+    proc = await asyncio.create_subprocess_exec(
+        "sudo", "-n", "systemctl", verb, _SERVICE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate()
+    if proc.returncode != 0:
+        msg = (err.decode("utf-8", errors="replace").strip() or
+               out.decode("utf-8", errors="replace").strip() or
+               f"systemctl {verb} failed (rc={proc.returncode})")
+        return web.json_response({"error": msg, "ok": False}, status=500)
+    return web.json_response({"ok": True})
+
+
+async def stop_sidecar(_request: web.Request):
+    return await _systemctl("stop")
+
+
+async def start_sidecar(_request: web.Request):
+    return await _systemctl("start")
+
+
 def setup(app: web.Application) -> None:
     """Register limiter routes onto the aiohttp app."""
-    app.router.add_get("/api/limiter/status", get_status)
+    app.router.add_get ("/api/limiter/status", get_status)
     app.router.add_post("/api/limiter/params", set_params)
-    app.router.add_post("/api/limiter/reset", reset_stats)
+    app.router.add_post("/api/limiter/reset",  reset_stats)
+    app.router.add_post("/api/limiter/stop",   stop_sidecar)
+    app.router.add_post("/api/limiter/start",  start_sidecar)

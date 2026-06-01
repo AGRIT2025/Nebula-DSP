@@ -136,6 +136,8 @@ export const nebulaAPI = {
   limiterSetParams: (p: Partial<LimiterParams>) =>
     apiPost<LimiterStatus>('/api/limiter/params', p),
   limiterReset: () => apiPost<LimiterStatus>('/api/limiter/reset'),
+  limiterStop:  () => apiPost<{ ok: boolean; error?: string }>('/api/limiter/stop'),
+  limiterStart: () => apiPost<{ ok: boolean; error?: string }>('/api/limiter/start'),
 }
 
 export interface LimiterStatus {

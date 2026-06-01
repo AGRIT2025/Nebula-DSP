@@ -105,6 +105,35 @@ export function Limiter() {
     } finally { setBusy(false) }
   }
 
+  const stopSidecar = async () => {
+    setBusy(true); setError(null)
+    try {
+      const r = await nebulaAPI.limiterStop()
+      if (!r.ok) throw new Error(r.error || 'systemctl stop failed')
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e))
+    } finally {
+      setBusy(false)
+      // Let the next poll reflect the new "offline" state.
+      poll()
+    }
+  }
+
+  const startSidecar = async () => {
+    setBusy(true); setError(null)
+    try {
+      const r = await nebulaAPI.limiterStart()
+      if (!r.ok) throw new Error(r.error || 'systemctl start failed')
+      initialised.current = false   // re-read params from the fresh sidecar
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e))
+    } finally {
+      setBusy(false)
+      // Give systemd + the binary ~1.5 s to come up, then refresh.
+      setTimeout(() => poll(), 1500)
+    }
+  }
+
   // Helper to mark dirty when any control changes so "Apply" lights up.
   const onChange = (fn: () => void) => { fn(); setDirty(true) }
 
@@ -129,6 +158,27 @@ export function Limiter() {
         {dirty && <Badge label="Unsaved" color="yellow" />}
 
         <div className="ml-auto flex items-center gap-2">
+          {online ? (
+            <button
+              onClick={stopSidecar}
+              disabled={busy}
+              title="Stop the brickwall sidecar (systemctl stop nebula-limiter)"
+              className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-[#ef444450] text-xs text-[#ef4444] hover:bg-[#ef444415] disabled:opacity-50 transition-all"
+            >
+              <Power size={12} />
+              Stop sidecar
+            </button>
+          ) : (
+            <button
+              onClick={startSidecar}
+              disabled={busy}
+              title="Start the brickwall sidecar (systemctl start nebula-limiter)"
+              className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-[#22c55e50] text-xs text-[#22c55e] hover:bg-[#22c55e15] disabled:opacity-50 transition-all"
+            >
+              <Power size={12} />
+              Start sidecar
+            </button>
+          )}
           <button
             onClick={reset}
             disabled={busy || !online}
